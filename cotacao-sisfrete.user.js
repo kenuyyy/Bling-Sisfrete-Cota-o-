@@ -7,8 +7,8 @@
 // @match        https://www.bling.com.br/*
 // @match        https://cliente.sisfrete.com.br/*
 // @homepageURL  https://github.com/kenuyyy/bling-sisfrete
-// @updateURL    https://raw.githubusercontent.com/SEU_USUARIO/bling-sisfrete/main/cotacao-sisfrete.user.js
-// @downloadURL  https://raw.githubusercontent.com/SEU_USUARIO/bling-sisfrete/main/cotacao-sisfrete.user.js
+// @updateURL    https://raw.githubusercontent.com/kenuyyy/Bling-Sisfrete-Cota-o-/main/cotacao-sisfrete.user.js
+// @downloadURL  https://raw.githubusercontent.com/kenuyyy/Bling-Sisfrete-Cota-o-/main/cotacao-sisfrete.user.js
 // @noframes
 // @run-at       document-idle
 // @grant        GM_getValue
