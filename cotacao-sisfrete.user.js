@@ -40,6 +40,16 @@
   const VERSION_URL = 'https://raw.githubusercontent.com/kenuyyy/Bling-Sisfrete-Cota-o-/main/cotacao-sisfrete.user.js';
   const VERSION_CACHE = 'bs_version_cache_v20';
   const ERROR_HISTORY = 'bs_error_history_v20';
+  const QUOTE_GUARD = 'bs_cotacao_guard_v20';
+  function submitOnce(account,order) {
+    // Reservar imediatamente antes do unico clique em Cotar.
+    const key=QUOTE_GUARD+'_'+encodeURIComponent(account)+'_'+encodeURIComponent(order);
+    const previous=GM_getValue(key,null);
+    if(previous && Number.isFinite(previous.at) && Date.now()-previous.at<3*60000) {
+      throw new Error('Esta cotacao ja foi solicitada nos ultimos 3 minutos. Confira o resultado antes de solicitar novamente.');
+    }
+    GM_setValue(key,{at:Date.now(),account,order,version:VERSION});
+  }
   const KEY = 'bling_para_sisfrete_cotacao_v1';
   const HOTKEY_KEY = 'bling_para_sisfrete_atalhos_v1';
   const DEST_KEY = 'bling_para_sisfrete_destinos_por_conta_v1';
@@ -479,6 +489,7 @@
     previewEl.hidden = false;
     previewEl.textContent = data ? JSON.stringify({
       pedido: data.order, cep: data.cep, cidade: data.city || null, valorTotalVenda: brMoney(data.totalCents),
+      freteBlingTransportador: Number.isSafeInteger(data.blingFreightCents) ? brMoney(data.blingFreightCents) : 'nao identificado',
       itens: data.items, capturadoEm: data.capturedAt
     }, null, 2) : 'Ainda nao existe um pedido capturado.';
   }
@@ -549,7 +560,16 @@
     if (!/^\d{8}$/.test(cep)) throw new Error('CEP de entrega ausente ou invalido (precisa de 8 digitos).');
     const items = blingItems();
     const city = getBlingValue('Cidade', address).trim();
-    const data = { order, cep, city, totalCents, items, source: location.href, capturedAt: new Date().toISOString() };
+    let blingFreightCents=null;
+    try {
+      // Frete na secao Transportador; nao confundir com Custo Frete do Marketplace.
+      const freightArea=afterSection('Transportador','Objetos de postagem');
+      if(freightArea.after!=null && textMatches('Frete',freightArea).length===1) {
+        const result=moneyCents(getBlingValue('Frete',freightArea));
+        if(Number.isSafeInteger(result) && result>=0) blingFreightCents=result;
+      }
+    } catch(e) {console.warn(msgPrefix,'Frete Bling nao identificado',e);}
+    const data = { order, cep, city, totalCents, items, blingFreightCents, source: location.href, capturedAt: new Date().toISOString() };
     GM_setValue(KEY, data);
     markStatus(`Pedido ${order}: ${items.length} SKU(s), CEP ${cep}, venda R$ ${brMoney(totalCents)}. Capturado.`);
     showData();
@@ -711,10 +731,25 @@
       el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
       el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
     }
-    await waitFor(() => {
-      const dst = fieldByName('Destino', { maxX: 110 });
-      return dst && inputText(dst).length >= 2;
-    }, 7500, 'cidade de destino pelo CEP');
+    // Repetir no maximo uma busca de CEP, sem executar a cotacao.
+    for(let attempt=0;attempt<2;attempt++){
+      try{
+        await waitFor(()=>{
+          const dst=fieldByName('Destino',{maxX:110});
+          return dst && inputText(dst).length>=2;
+        }, attempt===0?6500:4500,'cidade de destino pelo CEP');
+        break;
+      }catch(e){
+        if(attempt===1)throw e;
+        if(digits(el.value)!==cep)throw new Error('CEP mudou durante a busca. Cotacao bloqueada.');
+        markStatus('Busca de CEP demorou: repetindo apenas a consulta...');
+        if(lookups[0])userClick(lookups[0]);
+        else{
+          el.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true}));
+          el.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',bubbles:true}));
+        }
+      }
+    }
     if (digits(el.value) !== cep) throw new Error('O CEP da Sisfrete nao coincide com o CEP de entrega do Bling.');
     const foundCity = inputText(fieldByName('Destino', { maxX: 110 }));
     if (city && !norm(foundCity).includes(norm(city))) {
@@ -1017,12 +1052,19 @@
       resultMeta.textContent = 'Ainda nao reconheci uma tabela/cartao com transportadora, preco e prazo. Aguarde o resultado ou envie o Diagnostico; nao vou inventar valores.';
       return;
     }
-    resultMeta.textContent = `${rows.length} opcao(oes) lida(s) da tela | pedido ${token.order} | menor preco primeiro. Confirme o resultado na Sisfrete.`;
+    const reference=getData()?.blingFreightCents;
+    const comparable=Number.isSafeInteger(reference)&&reference>=0;
+    resultMeta.textContent=`${rows.length} opcao(oes) lida(s) | pedido ${token.order}. `+
+      (comparable ? `Frete Bling (Transportador): R$ ${brMoney(reference)}. Confirme se as modalidades sao comparaveis.` :
+        'Frete Bling nao identificado; diferenca indisponivel.');
     for (const r of rows) {
       const line = document.createElement('div');
       line.style.cssText = 'border-top:1px solid #d1fae5;padding:7px 0;display:grid;gap:2px';
       const name = document.createElement('strong'); name.textContent = r.company;
-      const info = document.createElement('span'); info.textContent = `R$ ${brMoney(r.priceCents)} | Prazo: ${r.deadline}`;
+      const info=document.createElement('span');
+      const diff=comparable?r.priceCents-reference:null;
+      info.textContent=`R$ ${brMoney(r.priceCents)} | Prazo: ${r.deadline}`+
+        (diff==null?'':` | vs Bling: ${diff===0?'igual':('R$ '+brMoney(Math.abs(diff))+(diff<0?' abaixo':' acima'))}`);
       line.append(name,info);
       resultList.append(line);
     }
@@ -1092,8 +1134,13 @@
     copy.addEventListener('click', () => {
       const token = comparisonToken();
       if (!token || !lastComparison.length) { markStatus('Nao ha resultados verificados para copiar.', true); return; }
-      const lines = [`Pedido ${token.order} | Conta ${token.account}`, 'Transportadora\tFrete (R$)\tPrazo'];
-      for (const r of lastComparison) lines.push([r.company,brMoney(r.priceCents),r.deadline].join('\t'));
+      const ref=getData()?.blingFreightCents;
+      const valid=Number.isSafeInteger(ref)&&ref>=0;
+      const lines=[`Pedido ${token.order} | Conta ${token.account}`,
+        valid?`Frete Bling (Transportador): R$ ${brMoney(ref)}`:'Frete Bling: N/D',
+        'Transportadora\tFrete (R$)\tPrazo\tDiferenca vs Bling (R$)'];
+      for(const r of lastComparison)lines.push([r.company,brMoney(r.priceCents),r.deadline,
+        valid?brMoney(r.priceCents-ref):'N/D'].join('\t'));
       GM_setClipboard(lines.join('\n'), 'text');
       markStatus('Comparativo copiado. Transportadoras nao foram selecionadas nem contratadas.');
     });
@@ -1192,6 +1239,7 @@
     if (existingOrder && existingOrder !== data.order) {
       throw new Error(`A tela Sisfrete ja contem pedido ${existingOrder}. Abra uma Nova Cotacao vazia para evitar misturar pedidos.`);
     }
+    stage('selecionar-CD');
     markStatus(`Preenchendo pedido ${data.order} | CD ${dest.cd} | Canal ${dest.channel}...`);
     await chooseByLabel('Centro de Distribuicao', dest.cd);
     // O canal so fica disponivel apos o CD terminar de atualizar a interface.
@@ -1199,20 +1247,24 @@
     if (!valueInControl(selectContext('Centro de Distribuicao'), dest.cd)) {
       await chooseByLabel('Centro de Distribuicao', dest.cd);
     }
+    stage('selecionar-Canal');
     await chooseByLabel('Canal de Vendas', dest.channel);
     await sleep(1000);
     if (!valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
       await chooseByLabel('Canal de Vendas', dest.channel);
     }
     if (sisAccountKey() !== accountAtStart) throw new Error('A conta Sisfrete mudou durante a selecao de CD/canal. Interrompi por seguranca.');
+    stage('consultar-CEP');
     await lookupCep(data.cep, data.city || '');
     setNativeValue(requireField('Numero do Pedido'), data.order);
+    stage('preencher-produtos');
     const prices = await writeProducts(data);
     await sleep(650);
     if (!valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
       markStatus('Canal de Vendas foi limpo pela Sisfrete; selecionando novamente...');
       await chooseByLabel('Canal de Vendas', dest.channel);
     }
+    stage('validar-formulario');
     await validateSisfrete(data, prices);
     await sleep(650);
     if (sisAccountKey() !== accountAtStart || !valueInControl(selectContext('Centro de Distribuicao'), dest.cd) || !valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
@@ -1220,6 +1272,7 @@
     }
     markStatus(`Conferido: pedido ${data.order}, ${data.items.length} SKU(s), R$ ${brMoney(data.totalCents)}.`);
     if (!quoteAfter) {
+      stage('preenchimento-validado');
       markStatus('Preenchimento concluido e validado. Confira a tela antes de cotar.');
       return;
     }
@@ -1228,6 +1281,8 @@
     if (!btn || btn.disabled) throw new Error('Formulario conferido, mas nao encontrei botao Cotar Frete habilitado.');
     // Armazenar a intencao ANTES do clique; a Sisfrete pode navegar de pagina.
     const comparisonToken = { order: data.order, account: accountAtStart, at: Date.now(), source: data.source };
+    stage('solicitar-cotacao');
+    submitOnce(accountAtStart,data.order);
     sessionStorage.setItem(COMPARE_KEY, JSON.stringify(comparisonToken));
     userClick(btn);
     startCompareWatch();
@@ -1237,6 +1292,7 @@
   function diagnostics() {
     const data = getData();
     const r = { versao:VERSION, etapa:stageName, acao:actionName, ultimaFalha:failures().at(-1)||null,
+      freteBlingTransportador: Number.isSafeInteger(data?.blingFreightCents) ? brMoney(data.blingFreightCents) : null,
       pagina: location.pathname, ambiente: IS_BLING ? 'bling' : 'sisfrete',
       origemCapturada: data?.order || null, itensCapturados: data?.items?.map(x => ({sku:x.sku, quantidade:x.qty, centavosLinha:x.lineCents})) || [], ultimoErro: lastError,
       ...(IS_SIS ? { contaIdentificada: sisAccountLabel() || null, destinoConfigurado: destination() } : {}) };
