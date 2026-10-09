@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bling -> Sisfrete | Cotacao de pedidos
 // @namespace    local.bling.sisfrete.cotacao
-// @version      2.0.0
-// @description  v2.0: selecao CD/canal, diagnosticos, atualizacoes, recuperacao e comparativo frete.
+// @version      2.0.1
+// @description  v2.0.1: corrige seletores Element Plus e confirma CD/canal sem travar.
 // @match        https://bling.com.br/*
 // @match        https://www.bling.com.br/*
 // @match        https://cliente.sisfrete.com.br/*
@@ -26,7 +26,7 @@
   'use strict';
 
   /*
-   * VERSAO 2.0 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
+   * VERSAO 2.0.1 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
    * formulario e preenche/cota conforme configuracao. Atualizacoes GitHub ativas.
    * Instalar a partir do arquivo cotacao-sisfrete.user.js do repositorio publico.
    * F8 e acoes manuais sao mantidos; a cotacao nao contrata frete.
@@ -584,27 +584,32 @@
   function selectContext(label) {
     const anchor = textOne(label);
     if (!anchor) return null;
-    const widgets = '.el-select, .el-select-v2, .ant-select, .v-select, .multiselect, .select2-container, [role="combobox"]';
     const f = structuralField(anchor);
-    let root = f?.closest(widgets) || null;
-    // A etiqueta e o select costumam estar no mesmo bloco (Element UI / Vue),
-    // que continua sendo o mesmo elemento mesmo quando as colunas quebram.
+    if (!f) return null;
+    // Element Plus: o input de pesquisa fica em .el-select__input,
+    // mas o texto selecionado fica FORA dele em .el-select__wrapper.
+    // A v2.0 tratava .el-select__input como raiz e nao conseguia ler BABUS.
+    const components='.el-select, .el-select-v2, .ant-select, .v-select, .multiselect, .select2-container';
+    const wrappers='.el-select__wrapper, .el-select-v2__wrapper, .ant-select-selector, .select2-selection, [role="combobox"]';
+    let root=f.closest(components) || f.closest(wrappers);
+    // Localizar o wrapper no grupo do campo, nunca o seletor global "CDs".
     if (!root) {
-      for (let ancestor = anchor.node, depth = 0; ancestor && depth < 7; ancestor = ancestor.parentElement, depth++) {
-        if (ancestor === document.body) break;
-        const candidates = [...ancestor.querySelectorAll(widgets)].filter(visible)
-          .filter(el => ![...ancestor.querySelectorAll(widgets)].some(other => other !== el && other.contains(el)));
-        if (candidates.length === 1) { root = candidates[0]; break; }
-        if (candidates.length > 1) break;
+      for(let parent=f.parentElement, depth=0;parent && depth<7;parent=parent.parentElement,depth++){
+        if(parent===document.body || parent.closest('#bs-quote-panel'))break;
+        const matches=[...parent.querySelectorAll(components+', '+wrappers)].filter(el=>visible(el));
+        const candidates=matches.filter(el=>!matches.some(other=>other!==el && other.contains(el)));
+        if(candidates.length===1 && candidates[0].contains(f)) {root=candidates[0];break;}
+        if(parent.contains(anchor.node) && parent.querySelectorAll('input,select,textarea').length>1)break;
       }
     }
-    // Controle nativo/associado: nao exige componente com classe fixa.
-    if (!root && f) root = f.parentElement || f;
-    if (!root) return null;
-    const input = (root.matches('input,select') ? root : root.querySelector('input,select')) || f;
-    const trigger = root.querySelector('.el-select__wrapper, .el-select-v2__wrapper, .ant-select-selector, .select2-selection, [role="combobox"]') ||
-      (root.matches('[role="combobox"]') ? root : root);
-    return { anchor, root, input, trigger };
+    if(!root && f.tagName==='SELECT')root=f;
+    // Nao aceitar .el-select__input como root: ele nao contem o valor visual.
+    if(!root || root.classList?.contains('el-select__input'))return null;
+    const input=root.matches('input,select')?root:
+      (root.contains(f) && f.matches('input,select')?f:root.querySelector('input,select'));
+    const trigger=root.matches(wrappers)?root:
+      (root.querySelector('.el-select__wrapper, .el-select-v2__wrapper, .ant-select-selector, .select2-selection, [role="combobox"]') || root);
+    return {anchor,root,input,trigger};
   }
   function isControlDisabled(ctx) {
     const el = ctx?.input;
@@ -641,6 +646,13 @@
     root.querySelectorAll('input,[role="combobox"]').forEach(el=>{
       if(visible(el)) values.push(el.value,el.getAttribute('title'),el.getAttribute('aria-valuetext'));
     });
+    // Texto do wrapper real (sem dropdown dentro do controle).
+    // Esse valor pode estar fora do input e ainda ser a selecao oficial.
+    if(root.querySelectorAll('input,select,textarea').length<=1 &&
+       !root.querySelector('[role="listbox"],[role="option"],.el-select-dropdown__item')) {
+      const display=root.innerText || root.textContent;
+      if(display) values.push(display);
+    }
     // Em algumas contas o DOM mostra a opcao ao lado do root do select.
     // Subir apenas ao primeiro ancestral que CONTEM a etiqueta E um unico input.
     let parent=root;
