@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bling -> Sisfrete | Cotacao de pedidos
 // @namespace    local.bling.sisfrete.cotacao
-// @version      1.9.1
-// @description  v1.9.1: confirmacao robusta de CD e Canal de Vendas apos atualizacao do formulario.
+// @version      2.0.0
+// @description  v2.0: selecao CD/canal, diagnosticos, atualizacoes, recuperacao e comparativo frete.
 // @match        https://bling.com.br/*
 // @match        https://www.bling.com.br/*
 // @match        https://cliente.sisfrete.com.br/*
@@ -18,13 +18,15 @@
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (() => {
   'use strict';
 
   /*
-   * VERSAO 1.9 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
+   * VERSAO 2.0 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
    * formulario e preenche/cota conforme configuracao. Atualizacoes GitHub ativas.
    * Instalar a partir do arquivo cotacao-sisfrete.user.js do repositorio publico.
    * F8 e acoes manuais sao mantidos; a cotacao nao contrata frete.
@@ -34,6 +36,20 @@
    * Nao adivinha informacoes ausentes: bloqueia a cotacao e fornece diagnostico.
    * Os dados ficam no armazenamento local da extensao Tampermonkey.
    */
+  const VERSION = '2.0.0';
+  const VERSION_URL = 'https://raw.githubusercontent.com/kenuyyy/Bling-Sisfrete-Cota-o-/main/cotacao-sisfrete.user.js';
+  const VERSION_CACHE = 'bs_version_cache_v20';
+  const ERROR_HISTORY = 'bs_error_history_v20';
+  const QUOTE_GUARD = 'bs_cotacao_guard_v20';
+  function submitOnce(account,order) {
+    // Reservar imediatamente antes do unico clique em Cotar.
+    const key=QUOTE_GUARD+'_'+encodeURIComponent(account)+'_'+encodeURIComponent(order);
+    const previous=GM_getValue(key,null);
+    if(previous && Number.isFinite(previous.at) && Date.now()-previous.at<3*60000) {
+      throw new Error('Esta cotacao ja foi solicitada nos ultimos 3 minutos. Confira o resultado antes de solicitar novamente.');
+    }
+    GM_setValue(key,{at:Date.now(),account,order,version:VERSION});
+  }
   const KEY = 'bling_para_sisfrete_cotacao_v1';
   const HOTKEY_KEY = 'bling_para_sisfrete_atalhos_v1';
   const DEST_KEY = 'bling_para_sisfrete_destinos_por_conta_v1';
@@ -79,6 +95,59 @@
   let comparisonTimer = null;
   let comparisonBusy = false;
   let lastComparison = [];
+  let stageName='pronto', actionName='', noticeVersion=null, newestVersion='';
+  function stage(value) { stageName=value; log('Etapa',value); }
+  function cmpVersions(x,y) {
+    const a=String(x).split('.').map(Number), b=String(y).split('.').map(Number);
+    if([...a,...b].some(n=>!Number.isInteger(n)||n<0))return 0;
+    for(let i=0;i<Math.max(a.length,b.length);i++) {
+      if((a[i]||0)!==(b[i]||0))return (a[i]||0)>(b[i]||0)?1:-1;
+    }
+    return 0;
+  }
+  function failures() {
+    try {const a=GM_getValue(ERROR_HISTORY,[]);return Array.isArray(a)?a:[];}
+    catch(_) {return [];}
+  }
+  function saveFailure(err) {
+    try {
+      const data=getData();
+      const event={time:new Date().toISOString(),version:VERSION,action:actionName||'acao',
+        stage:stageName,site:IS_BLING?'bling':'sisfrete',route:location.pathname,
+        order:data?.order||null,account:IS_SIS?sisAccountKey():null,
+        message:String(err?.message||err).slice(0,500)};
+      GM_setValue(ERROR_HISTORY,[...failures(),event].slice(-15));
+    } catch(e) {console.warn(msgPrefix,'Nao consegui registrar erro',e);}
+  }
+  function refreshVersionNotice() {
+    if(!noticeVersion)return;
+    const found=newestVersion && cmpVersions(newestVersion,VERSION)>0;
+    noticeVersion.hidden=!found;
+    noticeVersion.textContent=found ?
+      'Atualizacao '+newestVersion+' disponivel. Verifique atualizacoes no Tampermonkey.' : '';
+  }
+  function checkNewVersion(force=false) {
+    if(typeof GM_xmlhttpRequest!=='function')return;
+    const cache=GM_getValue(VERSION_CACHE,{})||{};
+    if(!force && Number.isFinite(cache.at) && Date.now()-cache.at<6*3600000) {
+      newestVersion=String(cache.version||'');refreshVersionNotice();return;
+    }
+    try {
+      GM_xmlhttpRequest({method:'GET',url:VERSION_URL,timeout:10000,
+        headers:{'Cache-Control':'no-cache'},
+        onload:r=>{
+          if(r.status!==200)return;
+          const match=String(r.responseText||'').match(/^\s*\/\/\s*@version\s+(\d+\.\d+(?:\.\d+)?)/m);
+          if(!match)return;
+          newestVersion=match[1];
+          GM_setValue(VERSION_CACHE,{at:Date.now(),version:newestVersion});
+          refreshVersionNotice();
+        }, ontimeout:()=>console.warn(msgPrefix,'Verificacao de versao expirou'),
+        onerror:()=>console.warn(msgPrefix,'Nao foi possivel verificar versao')
+      });
+    } catch(e) {console.warn(msgPrefix,'Nao foi possivel iniciar verificacao de versao',e);}
+  }
+
 
   function visible(el) {
     if (!el || el.closest('#bs-quote-panel')) return false;
@@ -420,6 +489,7 @@
     previewEl.hidden = false;
     previewEl.textContent = data ? JSON.stringify({
       pedido: data.order, cep: data.cep, cidade: data.city || null, valorTotalVenda: brMoney(data.totalCents),
+      freteBlingTransportador: Number.isSafeInteger(data.blingFreightCents) ? brMoney(data.blingFreightCents) : 'nao identificado',
       itens: data.items, capturadoEm: data.capturedAt
     }, null, 2) : 'Ainda nao existe um pedido capturado.';
   }
@@ -490,7 +560,16 @@
     if (!/^\d{8}$/.test(cep)) throw new Error('CEP de entrega ausente ou invalido (precisa de 8 digitos).');
     const items = blingItems();
     const city = getBlingValue('Cidade', address).trim();
-    const data = { order, cep, city, totalCents, items, source: location.href, capturedAt: new Date().toISOString() };
+    let blingFreightCents=null;
+    try {
+      // Frete na secao Transportador; nao confundir com Custo Frete do Marketplace.
+      const freightArea=afterSection('Transportador','Objetos de postagem');
+      if(freightArea.after!=null && textMatches('Frete',freightArea).length===1) {
+        const result=moneyCents(getBlingValue('Frete',freightArea));
+        if(Number.isSafeInteger(result) && result>=0) blingFreightCents=result;
+      }
+    } catch(e) {console.warn(msgPrefix,'Frete Bling nao identificado',e);}
+    const data = { order, cep, city, totalCents, items, blingFreightCents, source: location.href, capturedAt: new Date().toISOString() };
     GM_setValue(KEY, data);
     markStatus(`Pedido ${order}: ${items.length} SKU(s), CEP ${cep}, venda R$ ${brMoney(totalCents)}. Capturado.`);
     showData();
@@ -536,29 +615,46 @@
       ctx?.root?.classList.contains('el-select--disabled') ||
       !!ctx?.root?.querySelector('[role="combobox"][aria-disabled="true"], .el-select__wrapper.is-disabled, .el-select__wrapper[aria-disabled="true"]'));
   }
+  // A selecao pode estar no wrapper irmao, nao dentro de input.value.
+  // Confirmar exclusivamente o proprio grupo rotulado, sem ler outro CD ou menu aberto.
+  function matchSelectedValue(raw, expected) {
+    const got=norm(raw), want=norm(expected);
+    if (!got || !want) return false;
+    if (got===want) return true;
+    const clipped=got.match(/^(.{12,}?)(?:\.\.\.|…)$/);
+    return !!(clipped && want.startsWith(clipped[1].trim()));
+  }
   function valueInControl(ctx, expected) {
-    if (!ctx || !norm(expected)) return false;
-    const wanted = norm(expected);
-    const { root, input } = ctx;
-    if (!root) return false;
-    const values = [input?.value, input?.getAttribute('title'), input?.getAttribute('aria-valuetext')];
-    if (input?.tagName === 'SELECT') values.push(input.selectedOptions?.[0]?.textContent);
-    // Ler somente o texto SELECIONADO no proprio componente.
-    // Nunca ler textos soltos por coordenadas: gerava falso positivo de canal preenchido.
-    const selector = '.el-select__selected-item, .el-select__selection-item, .el-select__placeholder, .ant-select-selection-item, .select2-selection__rendered, [class*="selected-item"], [class*="single-value"]';
-    root.querySelectorAll(selector).forEach(el => {
-      if (!visible(el) || el.classList?.contains('is-transparent') ||
-          el.closest('[role="listbox"], .el-select-dropdown, .el-popper, .dropdown-menu, [role="option"]')) return;
-      values.push(el.textContent, el.getAttribute('title'));
+    if (!ctx?.root || !ctx.anchor) return false;
+    const { root,input,anchor }=ctx;
+    const values=[
+      input?.value,input?.getAttribute('value'),input?.getAttribute('title'),
+      input?.getAttribute('aria-valuetext'),root.getAttribute('title')
+    ];
+    if(input?.tagName==='SELECT') values.push(input.selectedOptions?.[0]?.textContent);
+    const chosen='.el-select__selected-item, .el-select__selection-item, .el-select__placeholder, .el-select__selected-label, .ant-select-selection-item, .select2-selection__rendered, [class*="selected-item"], [class*="single-value"]';
+    root.querySelectorAll(chosen).forEach(el=>{
+      if (visible(el) && !el.closest('[role="listbox"],[role="option"],.el-select-dropdown,.el-popper')) {
+        values.push(el.textContent,el.getAttribute('title'),el.getAttribute('aria-label'));
+      }
     });
-    // Frameworks que mostram a opcao diretamente no wrapper.
-    const rectangle = position(root);
-    const fields = root.querySelectorAll('input,select,textarea');
-    if (rectangle.height > 0 && rectangle.height < 95 && fields.length <= 1 &&
-        !root.querySelector('[role="option"], .el-select-dropdown__item, [role="listbox"]')) {
-      values.push(root.textContent);
+    root.querySelectorAll('input,[role="combobox"]').forEach(el=>{
+      if(visible(el)) values.push(el.value,el.getAttribute('title'),el.getAttribute('aria-valuetext'));
+    });
+    // Em algumas contas o DOM mostra a opcao ao lado do root do select.
+    // Subir apenas ao primeiro ancestral que CONTEM a etiqueta E um unico input.
+    let parent=root;
+    for(let depth=0;parent && depth<6;parent=parent.parentElement,depth++){
+      if(parent===document.body || parent.closest('#bs-quote-panel'))break;
+      if(!parent.contains(anchor.node))continue;
+      if(parent.querySelectorAll('input,select,textarea').length!==1)break;
+      if(parent.querySelector('[role="listbox"],[role="option"],.el-select-dropdown__item'))break;
+      const label=norm(anchor.node.textContent);
+      const text=norm(parent.innerText||parent.textContent||'');
+      if(text.startsWith(label)) values.push(text.slice(label.length).trim());
+      break;
     }
-    return values.some(v => norm(v) === wanted);
+    return values.some(v=>matchSelectedValue(v,expected));
   }
   function exactOption(value, selectedRoot) {
     const wanted = norm(value);
@@ -635,10 +731,25 @@
       el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
       el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
     }
-    await waitFor(() => {
-      const dst = fieldByName('Destino', { maxX: 110 });
-      return dst && inputText(dst).length >= 2;
-    }, 7500, 'cidade de destino pelo CEP');
+    // Repetir no maximo uma busca de CEP, sem executar a cotacao.
+    for(let attempt=0;attempt<2;attempt++){
+      try{
+        await waitFor(()=>{
+          const dst=fieldByName('Destino',{maxX:110});
+          return dst && inputText(dst).length>=2;
+        }, attempt===0?6500:4500,'cidade de destino pelo CEP');
+        break;
+      }catch(e){
+        if(attempt===1)throw e;
+        if(digits(el.value)!==cep)throw new Error('CEP mudou durante a busca. Cotacao bloqueada.');
+        markStatus('Busca de CEP demorou: repetindo apenas a consulta...');
+        if(lookups[0])userClick(lookups[0]);
+        else{
+          el.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true}));
+          el.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',code:'Enter',bubbles:true}));
+        }
+      }
+    }
     if (digits(el.value) !== cep) throw new Error('O CEP da Sisfrete nao coincide com o CEP de entrega do Bling.');
     const foundCity = inputText(fieldByName('Destino', { maxX: 110 }));
     if (city && !norm(foundCity).includes(norm(city))) {
@@ -797,13 +908,28 @@
       setNativeValue(fresh.qty, item.qty);
       setNativeValue(fresh.unit, brMoney(prices[i]));
       // O SKU deve vir cadastrado na Sisfrete para popular peso/dimensoes.
-      await waitFor(() => {
-        const r = sisfreteRows()[i];
-        if (!r || inputText(r.sku) !== item.sku) return false;
-        const weight = decimal(r.weight?.value);
-        const dimensions = [r.length, r.width, r.height].map(el => decimal(el?.value));
-        return weight > 0 || dimensions.every(v => v > 0);
-      }, 3800, `dimensoes ou peso do SKU ${item.sku}`);
+      let recognized=false;
+      for(let attempt=0;attempt<2;attempt++){
+        try{
+          await waitFor(()=>{
+            const r=sisfreteRows()[i];
+            if(!r || inputText(r.sku)!==item.sku)return false;
+            const weight=decimal(r.weight?.value);
+            const dims=[r.length,r.width,r.height].map(el=>decimal(el?.value));
+            return weight>0 || dims.every(v=>v>0);
+          },attempt===0?3800:5000,`dimensoes ou peso do SKU ${item.sku}`);
+          recognized=true;
+          break;
+        }catch(err){
+          if(attempt===1)throw err;
+          const r=sisfreteRows()[i];
+          if(!r || inputText(r.sku)!==item.sku)throw new Error('SKU alterado pela pagina. Interrompendo cotacao.');
+          markStatus('Produto '+item.sku+' ainda sem dimensoes: tentando atualizar a selecao uma vez...');
+          setNativeValue(r.sku,item.sku);
+          await tryChooseSkuOption(item.sku);
+        }
+      }
+      if(!recognized)throw new Error('Produto '+item.sku+' sem dimensoes/peso depois de duas verificacoes.');
       await sleep(220);
     }
     return prices;
@@ -941,12 +1067,19 @@
       resultMeta.textContent = 'Ainda nao reconheci uma tabela/cartao com transportadora, preco e prazo. Aguarde o resultado ou envie o Diagnostico; nao vou inventar valores.';
       return;
     }
-    resultMeta.textContent = `${rows.length} opcao(oes) lida(s) da tela | pedido ${token.order} | menor preco primeiro. Confirme o resultado na Sisfrete.`;
+    const reference=getData()?.blingFreightCents;
+    const comparable=Number.isSafeInteger(reference)&&reference>=0;
+    resultMeta.textContent=`${rows.length} opcao(oes) lida(s) | pedido ${token.order}. `+
+      (comparable ? `Frete Bling (Transportador): R$ ${brMoney(reference)}. Confirme se as modalidades sao comparaveis.` :
+        'Frete Bling nao identificado; diferenca indisponivel.');
     for (const r of rows) {
       const line = document.createElement('div');
       line.style.cssText = 'border-top:1px solid #d1fae5;padding:7px 0;display:grid;gap:2px';
       const name = document.createElement('strong'); name.textContent = r.company;
-      const info = document.createElement('span'); info.textContent = `R$ ${brMoney(r.priceCents)} | Prazo: ${r.deadline}`;
+      const info=document.createElement('span');
+      const diff=comparable?r.priceCents-reference:null;
+      info.textContent=`R$ ${brMoney(r.priceCents)} | Prazo: ${r.deadline}`+
+        (diff==null?'':` | vs Bling: ${diff===0?'igual':('R$ '+brMoney(Math.abs(diff))+(diff<0?' abaixo':' acima'))}`);
       line.append(name,info);
       resultList.append(line);
     }
@@ -1016,8 +1149,13 @@
     copy.addEventListener('click', () => {
       const token = comparisonToken();
       if (!token || !lastComparison.length) { markStatus('Nao ha resultados verificados para copiar.', true); return; }
-      const lines = [`Pedido ${token.order} | Conta ${token.account}`, 'Transportadora\tFrete (R$)\tPrazo'];
-      for (const r of lastComparison) lines.push([r.company,brMoney(r.priceCents),r.deadline].join('\t'));
+      const ref=getData()?.blingFreightCents;
+      const valid=Number.isSafeInteger(ref)&&ref>=0;
+      const lines=[`Pedido ${token.order} | Conta ${token.account}`,
+        valid?`Frete Bling (Transportador): R$ ${brMoney(ref)}`:'Frete Bling: N/D',
+        'Transportadora\tFrete (R$)\tPrazo\tDiferenca vs Bling (R$)'];
+      for(const r of lastComparison)lines.push([r.company,brMoney(r.priceCents),r.deadline,
+        valid?brMoney(r.priceCents-ref):'N/D'].join('\t'));
       GM_setClipboard(lines.join('\n'), 'text');
       markStatus('Comparativo copiado. Transportadoras nao foram selecionadas nem contratadas.');
     });
@@ -1116,6 +1254,7 @@
     if (existingOrder && existingOrder !== data.order) {
       throw new Error(`A tela Sisfrete ja contem pedido ${existingOrder}. Abra uma Nova Cotacao vazia para evitar misturar pedidos.`);
     }
+    stage('selecionar-CD');
     markStatus(`Preenchendo pedido ${data.order} | CD ${dest.cd} | Canal ${dest.channel}...`);
     await chooseByLabel('Centro de Distribuicao', dest.cd);
     // O canal so fica disponivel apos o CD terminar de atualizar a interface.
@@ -1123,20 +1262,24 @@
     if (!valueInControl(selectContext('Centro de Distribuicao'), dest.cd)) {
       await chooseByLabel('Centro de Distribuicao', dest.cd);
     }
+    stage('selecionar-Canal');
     await chooseByLabel('Canal de Vendas', dest.channel);
     await sleep(1000);
     if (!valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
       await chooseByLabel('Canal de Vendas', dest.channel);
     }
     if (sisAccountKey() !== accountAtStart) throw new Error('A conta Sisfrete mudou durante a selecao de CD/canal. Interrompi por seguranca.');
+    stage('consultar-CEP');
     await lookupCep(data.cep, data.city || '');
     setNativeValue(requireField('Numero do Pedido'), data.order);
+    stage('preencher-produtos');
     const prices = await writeProducts(data);
     await sleep(650);
     if (!valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
       markStatus('Canal de Vendas foi limpo pela Sisfrete; selecionando novamente...');
       await chooseByLabel('Canal de Vendas', dest.channel);
     }
+    stage('validar-formulario');
     await validateSisfrete(data, prices);
     await sleep(650);
     if (sisAccountKey() !== accountAtStart || !valueInControl(selectContext('Centro de Distribuicao'), dest.cd) || !valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
@@ -1144,6 +1287,7 @@
     }
     markStatus(`Conferido: pedido ${data.order}, ${data.items.length} SKU(s), R$ ${brMoney(data.totalCents)}.`);
     if (!quoteAfter) {
+      stage('preenchimento-validado');
       markStatus('Preenchimento concluido e validado. Confira a tela antes de cotar.');
       return;
     }
@@ -1152,6 +1296,8 @@
     if (!btn || btn.disabled) throw new Error('Formulario conferido, mas nao encontrei botao Cotar Frete habilitado.');
     // Armazenar a intencao ANTES do clique; a Sisfrete pode navegar de pagina.
     const comparisonToken = { order: data.order, account: accountAtStart, at: Date.now(), source: data.source };
+    stage('solicitar-cotacao');
+    submitOnce(accountAtStart,data.order);
     sessionStorage.setItem(COMPARE_KEY, JSON.stringify(comparisonToken));
     userClick(btn);
     startCompareWatch();
@@ -1160,7 +1306,9 @@
 
   function diagnostics() {
     const data = getData();
-    const r = { pagina: location.pathname, ambiente: IS_BLING ? 'bling' : 'sisfrete',
+    const r = { versao:VERSION, etapa:stageName, acao:actionName, ultimaFalha:failures().at(-1)||null,
+      freteBlingTransportador: Number.isSafeInteger(data?.blingFreightCents) ? brMoney(data.blingFreightCents) : null,
+      pagina: location.pathname, ambiente: IS_BLING ? 'bling' : 'sisfrete',
       origemCapturada: data?.order || null, itensCapturados: data?.items?.map(x => ({sku:x.sku, quantidade:x.qty, centavosLinha:x.lineCents})) || [], ultimoErro: lastError,
       ...(IS_SIS ? { contaIdentificada: sisAccountLabel() || null, destinoConfigurado: destination() } : {}) };
     if (IS_BLING) {
@@ -1176,7 +1324,14 @@
             ...(ctx ? { seletor: !!ctx.root, textoNoControle: (ctx.root.textContent || '').trim().slice(0, 80),
               valorInterno: ctx.input?.value || '', placeholder: ctx.input?.getAttribute('placeholder') || '',
               desabilitado: isControlDisabled(ctx),
-              selecaoEsperada: !!destination() && valueInControl(ctx, x === 'Centro de Distribuicao' ? destination().cd : destination().channel) } : {}) };
+              selecaoEsperada: !!destination() && valueInControl(ctx, x === 'Centro de Distribuicao' ? destination().cd : destination().channel),
+              detalheSeletor: {
+                classes: String(ctx.root?.className||'').slice(0,110),
+                textoPai: String(ctx.root?.parentElement?.innerText||'').slice(0,150),
+                controles: [...ctx.root.querySelectorAll('input,select,[role="combobox"]')].slice(0,3).map(el=>({
+                  tipo:el.tagName,valor:String(el.value||'').slice(0,75),titulo:String(el.getAttribute('title')||'').slice(0,75)
+                }))
+              } } : {}) };
         });
       r.linhas = (() => { try { return sisfreteRows().map((row, index) => ({ linha: index+1, sku: inputText(row.sku), quantidade: inputText(row.qty), peso: inputText(row.weight), comprimento: inputText(row.length), largura: inputText(row.width), altura: inputText(row.height), valorUnitario: inputText(row.unit), valorTotal: inputText(row.total) })); } catch (e) { return e.message; } })();
       r.transportadorasReconhecidas = (() => { try { return readTransportResults(); } catch (e) { return e.message; } })();
@@ -1192,8 +1347,9 @@
     if (busy) return;
     busy = true;
     for (const btn of panel.querySelectorAll('button')) btn.disabled = true;
-    try { await task(); lastError = ''; }
-    catch (e) { lastError = String(e?.message || e); markStatus('BLOQUEADO: ' + lastError, true); console.error(msgPrefix, e); }
+    actionName=task.name||'comando-manual';stage('iniciar');
+    try { await task(); lastError = ''; stage('concluido'); }
+    catch (e) { lastError = String(e?.message || e); saveFailure(e); markStatus('BLOQUEADO: ' + lastError, true); console.error(msgPrefix, e); }
     finally { busy = false; for (const btn of panel.querySelectorAll('button')) btn.disabled = false; }
   }
 
@@ -1496,7 +1652,7 @@
       'font-family:Arial,sans-serif;font-size:12px;box-sizing:border-box;';
     const titleRow = document.createElement('div');
     titleRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:7px;margin-bottom:5px';
-    const title = document.createElement('div'); title.textContent = 'Bling → Sisfrete | Cotar pedido v1.9';
+    const title = document.createElement('div'); title.textContent = 'Bling → Sisfrete | Cotar pedido v'+VERSION;
     title.style.cssText = 'font-weight:bold;font-size:14px';
     const closeButton = document.createElement('button');
     closeButton.type = 'button';
@@ -1510,6 +1666,11 @@
     });
     titleRow.append(title, closeButton);
     panel.appendChild(titleRow);
+    noticeVersion=document.createElement('div');
+    noticeVersion.hidden=true;
+    noticeVersion.style.cssText='background:#fff7ed;border:1px solid #fdba74;padding:7px;border-radius:6px;color:#9a3412;font-size:11px;margin-bottom:8px';
+    panel.appendChild(noticeVersion);
+    refreshVersionNotice();
     const sub = document.createElement('div'); sub.style.cssText = 'color:#64748b;margin-bottom:8px';
     sub.textContent = IS_BLING ? 'Origem: Bling · Pedido de venda' : 'Destino: Sisfrete · configure CD e Canal';
     if (IS_SIS) destinationSubtitle = sub;
@@ -1546,6 +1707,7 @@
 
     // Preferencia de painel independente no Bling e na Sisfrete, preservada ao navegar.
     setPanelVisibility(settings().panelHidden);
+    checkNewVersion();
     document.addEventListener('keydown', onHotkey, true);
     // Recupera o painel se um framework reconstruir o <body> ao navegar sem recarregar.
     let currentRoute = location.pathname;
