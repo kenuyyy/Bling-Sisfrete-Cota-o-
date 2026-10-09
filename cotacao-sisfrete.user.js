@@ -621,7 +621,7 @@
     const got=norm(raw), want=norm(expected);
     if (!got || !want) return false;
     if (got===want) return true;
-    const clipped=got.match(/^(.{12,}?)(?:\\.\\.\\.|…)$/);
+    const clipped=got.match(/^(.{12,}?)(?:\.\.\.|…)$/);
     return !!(clipped && want.startsWith(clipped[1].trim()));
   }
   function valueInControl(ctx, expected) {
