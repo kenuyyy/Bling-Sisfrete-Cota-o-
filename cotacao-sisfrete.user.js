@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bling -> Sisfrete | Cotacao de pedidos
 // @namespace    local.bling.sisfrete.cotacao
-// @version      1.9.1
-// @description  v1.9.1: confirmacao robusta de CD e Canal de Vendas apos atualizacao do formulario.
+// @version      2.0.0
+// @description  v2.0: selecao CD/canal, diagnosticos, atualizacoes, recuperacao e comparativo frete.
 // @match        https://bling.com.br/*
 // @match        https://www.bling.com.br/*
 // @match        https://cliente.sisfrete.com.br/*
@@ -26,7 +26,7 @@
   'use strict';
 
   /*
-   * VERSAO 1.9 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
+   * VERSAO 2.0 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
    * formulario e preenche/cota conforme configuracao. Atualizacoes GitHub ativas.
    * Instalar a partir do arquivo cotacao-sisfrete.user.js do repositorio publico.
    * F8 e acoes manuais sao mantidos; a cotacao nao contrata frete.
@@ -908,13 +908,28 @@
       setNativeValue(fresh.qty, item.qty);
       setNativeValue(fresh.unit, brMoney(prices[i]));
       // O SKU deve vir cadastrado na Sisfrete para popular peso/dimensoes.
-      await waitFor(() => {
-        const r = sisfreteRows()[i];
-        if (!r || inputText(r.sku) !== item.sku) return false;
-        const weight = decimal(r.weight?.value);
-        const dimensions = [r.length, r.width, r.height].map(el => decimal(el?.value));
-        return weight > 0 || dimensions.every(v => v > 0);
-      }, 3800, `dimensoes ou peso do SKU ${item.sku}`);
+      let recognized=false;
+      for(let attempt=0;attempt<2;attempt++){
+        try{
+          await waitFor(()=>{
+            const r=sisfreteRows()[i];
+            if(!r || inputText(r.sku)!==item.sku)return false;
+            const weight=decimal(r.weight?.value);
+            const dims=[r.length,r.width,r.height].map(el=>decimal(el?.value));
+            return weight>0 || dims.every(v=>v>0);
+          },attempt===0?3800:5000,`dimensoes ou peso do SKU ${item.sku}`);
+          recognized=true;
+          break;
+        }catch(err){
+          if(attempt===1)throw err;
+          const r=sisfreteRows()[i];
+          if(!r || inputText(r.sku)!==item.sku)throw new Error('SKU alterado pela pagina. Interrompendo cotacao.');
+          markStatus('Produto '+item.sku+' ainda sem dimensoes: tentando atualizar a selecao uma vez...');
+          setNativeValue(r.sku,item.sku);
+          await tryChooseSkuOption(item.sku);
+        }
+      }
+      if(!recognized)throw new Error('Produto '+item.sku+' sem dimensoes/peso depois de duas verificacoes.');
       await sleep(220);
     }
     return prices;
