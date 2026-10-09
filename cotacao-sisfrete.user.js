@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Bling -> Sisfrete | Cotacao de pedidos
 // @namespace    local.bling.sisfrete.cotacao
-// @version      1.8.0
-// @description  v1.8: cotacao Bling/Sisfrete, F8, zoom, varios itens, CD/canal por conta e atualizacoes pelo GitHub.
+// @version      1.9.0
+// @description  v1.9: F8 Bling -> reutilizar guia Sisfrete, abrir formulario e preencher/cotar automaticamente com validacoes.
 // @match        https://bling.com.br/*
 // @match        https://www.bling.com.br/*
 // @match        https://cliente.sisfrete.com.br/*
-// @homepageURL  https://github.com/kenuyyy/bling-sisfrete
+// @homepageURL  https://github.com/kenuyyy/Bling-Sisfrete-Cota-o-
 // @updateURL    https://raw.githubusercontent.com/kenuyyy/Bling-Sisfrete-Cota-o-/main/cotacao-sisfrete.user.js
 // @downloadURL  https://raw.githubusercontent.com/kenuyyy/Bling-Sisfrete-Cota-o-/main/cotacao-sisfrete.user.js
 // @noframes
@@ -24,10 +24,10 @@
   'use strict';
 
   /*
-   * VERSAO 1.8 — Base 1.7 com distribuicao pelo GitHub e verificacao de atualizacoes.
-   * ANTES DA PUBLICACAO: substituir SEU_USUARIO nas 3 linhas @homepageURL,
-   * @updateURL e @downloadURL acima. Nome do arquivo no repositorio:
-   * cotacao-sisfrete.user.js (ramo principal: main).
+   * VERSAO 1.9 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
+   * formulario e preenche/cota conforme configuracao. Atualizacoes GitHub ativas.
+   * Instalar a partir do arquivo cotacao-sisfrete.user.js do repositorio publico.
+   * F8 e acoes manuais sao mantidos; a cotacao nao contrata frete.
    * Resolve controles pela estrutura DOM, sem depender de colunas no zoom.
    * Nao grava, salva nem altera o pedido do Bling.
    * Nao seleciona transportadora ou contrata frete. Apenas solicita cotacao.
@@ -40,6 +40,8 @@
   const TAB_LIVE_PREFIX = 'bling_para_sisfrete_live_tab_v1_';
   const TAB_REQ_PREFIX = 'bling_para_sisfrete_reuse_req_v1_';
   const TAB_ACK_PREFIX = 'bling_para_sisfrete_reuse_ack_v1_';
+  const OPEN_REQ_PREFIX = 'bling_para_sisfrete_abertura_v19_';
+  const OPEN_HASH_PREFIX = '#bs-cotacao-';
   const TAB_TTL_MS = 180000; // abas em segundo plano podem ter timers reduzidos pelo navegador
   const RESUME_KEY = 'bs_cotacao_resume_v16'; // sessionStorage: somente apos F8 nesta aba
   const COMPARE_KEY = 'bs_cotacao_compare_v16'; // sessionStorage: leitura, nunca contrata frete
@@ -230,44 +232,84 @@
     }
     throw new Error(`Tempo esgotado esperando ${label}.`);
   }
-  // ------------------- GUIAS ABERTAS DA SISFRETE -------------------
-  // GM_* e compartilhado entre Bling e Sisfrete para ESTE userscript.
-  // Cada aba Sisfrete registra seu proprio ID e confirma pedidos de reutilizacao.
-  // Nao abre outra aba se uma aba existente confirmou que recebeu o pedido.
+  // ------------------- GUIAS ABERTAS E PREENCHIMENTO REMOTO -------------------
+  // A extensao nao consegue enumerar ou ativar qualquer guia do navegador.
+  // Uma guia Sisfrete com ESTA macro ativa registra sua presenca, recebe
+  // o pedido e pode navegar e preencher sem criar uma segunda guia.
   function pingSisfreteTab() {
     if (!IS_SIS) return;
     try {
       GM_setValue(TAB_LIVE_PREFIX + SIS_TAB_ID, {
-        at: Date.now(),
-        focusAt: sisTabLastFocused,
-        visible: document.visibilityState === 'visible',
-        path: location.pathname
+        at: Date.now(), focusAt: sisTabLastFocused,
+        visible: document.visibilityState === 'visible', path: location.pathname
       });
-    } catch (e) { console.warn(msgPrefix, 'Nao foi possivel registrar a aba Sisfrete', e); }
+    } catch (e) { console.warn(msgPrefix, 'Nao foi possivel registrar a guia Sisfrete', e); }
   }
   function stopSisfreteTab() {
     if (!IS_SIS) return;
     try {
       GM_deleteValue(TAB_LIVE_PREFIX + SIS_TAB_ID);
       GM_deleteValue(TAB_REQ_PREFIX + SIS_TAB_ID);
-      // Nao apagar o ACK aqui: a outra guia ainda pode estar lendo-o
-      // enquanto esta guia navega para Nova Cotacao.
-    } catch (_) { /* um registro antigo sera ignorado por expiracao */ }
+      // Preservar ACK ate a origem o ler, mesmo durante navegacao.
+    } catch (_) { /* registros expirados sao ignorados */ }
+  }
+  function buildResume(order, quote, account, newTab = false) {
+    return { order, quote: !!quote, account: account || null,
+      newTab: !!newTab, at: Date.now() };
+  }
+  function validateRemoteRequest(request) {
+    const data = getData();
+    if (!request?.order || !data || data.order !== request.order ||
+        (request.capturedAt && data.capturedAt !== request.capturedAt)) {
+      throw new Error('Pedido salvo mudou desde o F8. Recapture no Bling antes de preencher.');
+    }
+    if (!IS_SIS || busy) throw new Error('Guia Sisfrete ocupada; aguarde a operacao atual terminar.');
+    const account = sisAccountKey();
+    if (!account) throw new Error('Nao foi possivel confirmar a conta aberta na Sisfrete.');
+    if (IS_SIS_QUOTE()) {
+      const orderInput = fieldByName('Numero do Pedido');
+      const existing = inputText(orderInput);
+      if (existing && existing !== request.order) {
+        throw new Error('A guia Sisfrete ja contem o pedido ' + existing +
+          '. Abra um formulario vazio antes de cotar outro pedido.');
+      }
+    }
+    return account;
   }
   function listenForReuseRequest() {
     if (!IS_SIS) return;
     pingSisfreteTab();
     GM_addValueChangeListener(TAB_REQ_PREFIX + SIS_TAB_ID, (_key, _old, request) => {
-      if (!request || !request.nonce || Date.now() - Number(request.time) > 10000) return;
-      // Confirmacao enviada ANTES da navegacao (a pagina pode descarregar).
-      GM_setValue(TAB_ACK_PREFIX + SIS_TAB_ID, { nonce: request.nonce, at: Date.now() });
-      try { window.focus(); } catch (_) { /* o navegador pode impedir foco entre guias */ }
-      // Nao reabrir o painel se o usuario optou por mantê-lo oculto.
-      if (!IS_SIS_QUOTE()) {
-        location.assign(URL_SISFRETE);
-        return;
+      if (!request?.nonce || Date.now() - Number(request.time) > 15000) return;
+      let ack = { nonce: request.nonce, at: Date.now(), accepted: false };
+      try {
+        if (request.autoFill) {
+          const account = validateRemoteRequest(request);
+          // Guardar na SESSION desta mesma guia antes de mudar de rota.
+          sessionStorage.setItem(RESUME_KEY,
+            JSON.stringify(buildResume(request.order, request.quote, account)));
+          ack.autoFillAcknowledged = true;
+        }
+        ack.accepted = true;
+        GM_setValue(TAB_ACK_PREFIX + SIS_TAB_ID, ack);
+        try { window.focus(); } catch (_) { /* foco pode ser bloqueado pelo navegador */ }
+        if (!IS_SIS_QUOTE()) {
+          markStatus('Reutilizando esta guia: abrindo Nova Cotacao.');
+          location.assign(URL_SISFRETE);
+          return;
+        }
+        if (request.autoFill) {
+          markStatus('Pedido ' + request.order + ' recebido do Bling. Preenchendo a cotacao...');
+          // A rota ja esta aberta; nao aguardar outro F8.
+          resumeOnQuotePage();
+        } else {
+          markStatus('Esta guia da Sisfrete ja esta no formulario de cotacao.');
+        }
+      } catch (e) {
+        ack = { ...ack, accepted: false, reason: String(e?.message || e) };
+        GM_setValue(TAB_ACK_PREFIX + SIS_TAB_ID, ack);
+        markStatus('BLOQUEADO: ' + ack.reason, true);
       }
-      markStatus('Aba Sisfrete reutilizada. Pedido capturado pronto para preenchimento.');
     });
     setInterval(pingSisfreteTab, 10000);
     window.addEventListener('focus', () => { sisTabLastFocused = Date.now(); pingSisfreteTab(); });
@@ -285,28 +327,83 @@
       entries = GM_listValues().filter(name => name.startsWith(TAB_LIVE_PREFIX))
         .map(name => ({ id: name.slice(TAB_LIVE_PREFIX.length), ...GM_getValue(name, {}) }))
         .filter(tab => tab.id && Number.isFinite(tab.at) && now - tab.at >= 0 && now - tab.at < TAB_TTL_MS);
-    } catch (e) { console.warn(msgPrefix, 'Falha procurando abas Sisfrete', e); }
-    // Priorizar a guia que o usuario utilizou mais recentemente.
+    } catch (e) { console.warn(msgPrefix, 'Falha procurando guias Sisfrete', e); }
     return entries.sort((a, b) => (b.focusAt || 0) - (a.focusAt || 0) || b.at - a.at);
   }
-  async function openOrReuseSisfrete() {
+  async function openOrReuseSisfrete({ autoFill = false, data = null, quote = false } = {}) {
     if (!IS_BLING) return;
-    for (const tab of activeSisfreteTabs().slice(0, 4)) {
+    if (autoFill && (!data?.order || data.order !== getData()?.order))
+      throw new Error('Capture um pedido valido no Bling antes de abrir a Sisfrete.');
+    const tabs = activeSisfreteTabs();
+    for (const tab of tabs.slice(0, 8)) {
       const nonce = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
       try {
-        GM_setValue(TAB_REQ_PREFIX + tab.id, { nonce, time: Date.now() });
-        const acknowledged = await waitFor(() => GM_getValue(TAB_ACK_PREFIX + tab.id, {})?.nonce === nonce,
-          2400, 'confirmacao da guia Sisfrete existente').catch(() => false);
-        if (acknowledged) {
-          markStatus('Sisfrete ja estava aberta: reutilizei a guia existente sem criar outra. ' +
-            'Se o navegador nao trouxer a guia para frente, alterne para ela manualmente.');
+        GM_setValue(TAB_REQ_PREFIX + tab.id, {
+          nonce, time: Date.now(), autoFill, quote: !!quote,
+          order: data?.order || null, capturedAt: data?.capturedAt || null
+        });
+        const ack = await waitFor(() => {
+          const value = GM_getValue(TAB_ACK_PREFIX + tab.id, {});
+          return value?.nonce === nonce ? value : null;
+        }, 4200, 'resposta da guia Sisfrete existente').catch(() => null);
+        if (ack) {
+          if (ack.accepted === undefined) {
+            markStatus('Guia Sisfrete encontrada com uma versao antiga da macro. Atualize essa guia com F5 para permitir o F8 automatico.', true);
+            return;
+          }
+          if (!ack.accepted) {
+            markStatus('Guia Sisfrete encontrada, mas a operacao foi bloqueada: ' + (ack.reason || 'motivo desconhecido'), true);
+            return;
+          }
+          if (autoFill && !ack.autoFillAcknowledged) {
+            markStatus('Reutilizei a guia, mas ela ainda usa uma versao antiga da macro. Atualize a pagina Sisfrete com F5.', true);
+            return;
+          }
+          markStatus(autoFill
+            ? `Pedido ${data.order} enviado para a guia Sisfrete aberta. A navegacao e o preenchimento continuam nela.`
+            : 'Guia Sisfrete reutilizada; abrindo o formulario sem duplicar a guia.');
           return;
         }
-      } catch (e) { console.warn(msgPrefix, 'Nao foi possivel solicitar reutilizacao', e); }
+      } catch (e) { console.warn(msgPrefix, 'Falha ao solicitar reutilizacao', e); }
     }
-    // So abre uma nova aba se nenhuma aba registrada respondeu.
-    GM_openInTab(URL_SISFRETE, { active: true, insert: true });
-    markStatus('Nenhuma guia Sisfrete acessivel respondeu. Abri uma nova guia.');
+    // Somente quando nenhuma guia com a macro ATIVA respondeu. O hash inclui
+    // apenas um identificador temporario; os dados continuam no Tampermonkey.
+    let url = URL_SISFRETE;
+    let requestKey = null;
+    if (autoFill) {
+      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      requestKey = OPEN_REQ_PREFIX + nonce;
+      GM_setValue(requestKey, {
+        nonce, order: data.order, capturedAt: data.capturedAt,
+        quote: !!quote, at: Date.now()
+      });
+      url += OPEN_HASH_PREFIX + nonce;
+    }
+    try {
+      GM_openInTab(url, { active: true, insert: true });
+      markStatus(autoFill
+        ? `Abrindo Sisfrete para preencher pedido ${data.order} automaticamente.`
+        : 'Nenhuma guia Sisfrete respondeu; uma nova guia foi aberta.');
+    } catch (e) {
+      if (requestKey) GM_deleteValue(requestKey);
+      throw new Error('Nao foi possivel abrir Sisfrete. Verifique o bloqueio de novas guias e as permissoes Tampermonkey.');
+    }
+  }
+  function consumeNewTabRequest() {
+    if (!IS_SIS || !IS_SIS_QUOTE()) return;
+    const m = location.hash.match(/^#bs-cotacao-([a-zA-Z0-9_]+)$/);
+    if (!m) return;
+    // Remover o hash temporario da barra de enderecos, sem recarregar a pagina.
+    try { history.replaceState(history.state, '', location.pathname + location.search); } catch (_) { /* opcional */ }
+    const key = OPEN_REQ_PREFIX + m[1];
+    const req = GM_getValue(key, null);
+    GM_deleteValue(key); // token de uso unico
+    if (!req || req.nonce !== m[1] || Date.now() - Number(req.at) > 60000 ||
+        req.order !== getData()?.order || req.capturedAt !== getData()?.capturedAt) {
+      markStatus('Abertura automatica expirada ou pedido mudou. Pressione F8 novamente.', true);
+      return;
+    }
+    sessionStorage.setItem(RESUME_KEY, JSON.stringify(buildResume(req.order, req.quote, null, true)));
   }
 
   function markStatus(s, error = false) {
@@ -1071,26 +1168,30 @@
     finally { busy = false; for (const btn of panel.querySelectorAll('button')) btn.disabled = false; }
   }
 
-  // ------------------- NAVEGACAO AUTOMATICA DO F8 -------------------
-  // A navegacao a Nova Cotacao so preenche automaticamente quando o usuario
-  // pressionou o atalho NESTA guia, para este numero de pedido/conta.
+  // ------------------- RETOMADA SEGURA DEPOIS DA NAVEGACAO -------------------
+  // A sessao desta guia recebe o pedido do Bling. Mesmo apos navegar de
+  // /nova-cotacao para /form, a macro retoma o preenchimento sem outro F8.
   function resumeOnQuotePage() {
     if (!IS_SIS || !IS_SIS_QUOTE() || busy) return;
     let p;
     try { p = JSON.parse(sessionStorage.getItem(RESUME_KEY) || 'null'); } catch (_) { p = null; }
     if (!p) return;
-    sessionStorage.removeItem(RESUME_KEY); // executar no maximo uma vez
+    sessionStorage.removeItem(RESUME_KEY); // nunca cotar duas vezes no refresh
     if (Date.now() - Number(p.at) > 60000 || p.order !== getData()?.order) {
       markStatus('Retomada de cotacao expirada ou pedido mudou. Pressione F8 novamente.', true);
       return;
     }
-    if (!p.account || !sisAccountKey() || p.account !== sisAccountKey()) {
-      markStatus('A conta Sisfrete mudou durante a navegacao. Nao preenchi outra conta.', true);
-      return;
-    }
-    // Os componentes podem montar o formulario apos o carregamento da rota.
+    // A conta pode ser exibida somente depois de o app Vue carregar.
     execute(async () => {
-      await waitFor(() => textOne('Produtos') && textOne('Numero do Pedido'), 9000, 'formulario da Nova Cotacao');
+      const account = await waitFor(() => sisAccountKey(), 12000, 'identificacao da conta Sisfrete');
+      if (p.account && p.account !== account) {
+        throw new Error('A conta Sisfrete mudou durante a navegacao. Operacao interrompida.');
+      }
+      if (!p.account && !p.newTab) {
+        throw new Error('A conta de origem da navegacao nao foi identificada com seguranca.');
+      }
+      await waitFor(() => textOne('Produtos') && textOne('Numero do Pedido'),
+        12000, 'formulario da Nova Cotacao');
       await fillSisfrete(p.quote === true);
     });
   }
@@ -1157,8 +1258,10 @@
   function primaryAction() {
     const s = settings();
     if (IS_BLING) {
-      captureBling();
-      if (s.openAfterCapture) return openOrReuseSisfrete();
+      const data = captureBling();
+      if (s.openAfterCapture) return openOrReuseSisfrete({
+        autoFill: true, data, quote: s.sisAction === 'quote'
+      });
     } else if (IS_SIS) {
       if (!IS_SIS_QUOTE()) {
         const data = getData();
@@ -1364,7 +1467,7 @@
       'font-family:Arial,sans-serif;font-size:12px;box-sizing:border-box;';
     const titleRow = document.createElement('div');
     titleRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:7px;margin-bottom:5px';
-    const title = document.createElement('div'); title.textContent = 'Bling → Sisfrete | Cotar pedido v1.8';
+    const title = document.createElement('div'); title.textContent = 'Bling → Sisfrete | Cotar pedido v1.9';
     title.style.cssText = 'font-weight:bold;font-size:14px';
     const closeButton = document.createElement('button');
     closeButton.type = 'button';
@@ -1437,7 +1540,9 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initUI, { once: true });
   else initUI();
   if (IS_SIS) {
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => { resumeOnQuotePage(); startCompareWatch(); }, { once: true });
-    else { resumeOnQuotePage(); startCompareWatch(); }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => {
+      consumeNewTabRequest(); resumeOnQuotePage(); startCompareWatch();
+    }, { once: true });
+    else { consumeNewTabRequest(); resumeOnQuotePage(); startCompareWatch(); }
   }
 })();
