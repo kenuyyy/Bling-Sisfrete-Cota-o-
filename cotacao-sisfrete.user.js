@@ -536,29 +536,46 @@
       ctx?.root?.classList.contains('el-select--disabled') ||
       !!ctx?.root?.querySelector('[role="combobox"][aria-disabled="true"], .el-select__wrapper.is-disabled, .el-select__wrapper[aria-disabled="true"]'));
   }
+  // A selecao pode estar no wrapper irmao, nao dentro de input.value.
+  // Confirmar exclusivamente o proprio grupo rotulado, sem ler outro CD ou menu aberto.
+  function matchSelectedValue(raw, expected) {
+    const got=norm(raw), want=norm(expected);
+    if (!got || !want) return false;
+    if (got===want) return true;
+    const clipped=got.match(/^(.{12,}?)(?:\\.\\.\\.|…)$/);
+    return !!(clipped && want.startsWith(clipped[1].trim()));
+  }
   function valueInControl(ctx, expected) {
-    if (!ctx || !norm(expected)) return false;
-    const wanted = norm(expected);
-    const { root, input } = ctx;
-    if (!root) return false;
-    const values = [input?.value, input?.getAttribute('title'), input?.getAttribute('aria-valuetext')];
-    if (input?.tagName === 'SELECT') values.push(input.selectedOptions?.[0]?.textContent);
-    // Ler somente o texto SELECIONADO no proprio componente.
-    // Nunca ler textos soltos por coordenadas: gerava falso positivo de canal preenchido.
-    const selector = '.el-select__selected-item, .el-select__selection-item, .el-select__placeholder, .ant-select-selection-item, .select2-selection__rendered, [class*="selected-item"], [class*="single-value"]';
-    root.querySelectorAll(selector).forEach(el => {
-      if (!visible(el) || el.classList?.contains('is-transparent') ||
-          el.closest('[role="listbox"], .el-select-dropdown, .el-popper, .dropdown-menu, [role="option"]')) return;
-      values.push(el.textContent, el.getAttribute('title'));
+    if (!ctx?.root || !ctx.anchor) return false;
+    const { root,input,anchor }=ctx;
+    const values=[
+      input?.value,input?.getAttribute('value'),input?.getAttribute('title'),
+      input?.getAttribute('aria-valuetext'),root.getAttribute('title')
+    ];
+    if(input?.tagName==='SELECT') values.push(input.selectedOptions?.[0]?.textContent);
+    const chosen='.el-select__selected-item, .el-select__selection-item, .el-select__placeholder, .el-select__selected-label, .ant-select-selection-item, .select2-selection__rendered, [class*="selected-item"], [class*="single-value"]';
+    root.querySelectorAll(chosen).forEach(el=>{
+      if (visible(el) && !el.closest('[role="listbox"],[role="option"],.el-select-dropdown,.el-popper')) {
+        values.push(el.textContent,el.getAttribute('title'),el.getAttribute('aria-label'));
+      }
     });
-    // Frameworks que mostram a opcao diretamente no wrapper.
-    const rectangle = position(root);
-    const fields = root.querySelectorAll('input,select,textarea');
-    if (rectangle.height > 0 && rectangle.height < 95 && fields.length <= 1 &&
-        !root.querySelector('[role="option"], .el-select-dropdown__item, [role="listbox"]')) {
-      values.push(root.textContent);
+    root.querySelectorAll('input,[role="combobox"]').forEach(el=>{
+      if(visible(el)) values.push(el.value,el.getAttribute('title'),el.getAttribute('aria-valuetext'));
+    });
+    // Em algumas contas o DOM mostra a opcao ao lado do root do select.
+    // Subir apenas ao primeiro ancestral que CONTEM a etiqueta E um unico input.
+    let parent=root;
+    for(let depth=0;parent && depth<6;parent=parent.parentElement,depth++){
+      if(parent===document.body || parent.closest('#bs-quote-panel'))break;
+      if(!parent.contains(anchor.node))continue;
+      if(parent.querySelectorAll('input,select,textarea').length!==1)break;
+      if(parent.querySelector('[role="listbox"],[role="option"],.el-select-dropdown__item'))break;
+      const label=norm(anchor.node.textContent);
+      const text=norm(parent.innerText||parent.textContent||'');
+      if(text.startsWith(label)) values.push(text.slice(label.length).trim());
+      break;
     }
-    return values.some(v => norm(v) === wanted);
+    return values.some(v=>matchSelectedValue(v,expected));
   }
   function exactOption(value, selectedRoot) {
     const wanted = norm(value);
@@ -1176,7 +1193,14 @@
             ...(ctx ? { seletor: !!ctx.root, textoNoControle: (ctx.root.textContent || '').trim().slice(0, 80),
               valorInterno: ctx.input?.value || '', placeholder: ctx.input?.getAttribute('placeholder') || '',
               desabilitado: isControlDisabled(ctx),
-              selecaoEsperada: !!destination() && valueInControl(ctx, x === 'Centro de Distribuicao' ? destination().cd : destination().channel) } : {}) };
+              selecaoEsperada: !!destination() && valueInControl(ctx, x === 'Centro de Distribuicao' ? destination().cd : destination().channel),
+              detalheSeletor: {
+                classes: String(ctx.root?.className||'').slice(0,110),
+                textoPai: String(ctx.root?.parentElement?.innerText||'').slice(0,150),
+                controles: [...ctx.root.querySelectorAll('input,select,[role="combobox"]')].slice(0,3).map(el=>({
+                  tipo:el.tagName,valor:String(el.value||'').slice(0,75),titulo:String(el.getAttribute('title')||'').slice(0,75)
+                }))
+              } } : {}) };
         });
       r.linhas = (() => { try { return sisfreteRows().map((row, index) => ({ linha: index+1, sku: inputText(row.sku), quantidade: inputText(row.qty), peso: inputText(row.weight), comprimento: inputText(row.length), largura: inputText(row.width), altura: inputText(row.height), valorUnitario: inputText(row.unit), valorTotal: inputText(row.total) })); } catch (e) { return e.message; } })();
       r.transportadorasReconhecidas = (() => { try { return readTransportResults(); } catch (e) { return e.message; } })();
