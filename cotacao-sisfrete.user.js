@@ -18,6 +18,8 @@
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (() => {
@@ -34,6 +36,10 @@
    * Nao adivinha informacoes ausentes: bloqueia a cotacao e fornece diagnostico.
    * Os dados ficam no armazenamento local da extensao Tampermonkey.
    */
+  const VERSION = '2.0.0';
+  const VERSION_URL = 'https://raw.githubusercontent.com/kenuyyy/Bling-Sisfrete-Cota-o-/main/cotacao-sisfrete.user.js';
+  const VERSION_CACHE = 'bs_version_cache_v20';
+  const ERROR_HISTORY = 'bs_error_history_v20';
   const KEY = 'bling_para_sisfrete_cotacao_v1';
   const HOTKEY_KEY = 'bling_para_sisfrete_atalhos_v1';
   const DEST_KEY = 'bling_para_sisfrete_destinos_por_conta_v1';
@@ -79,6 +85,59 @@
   let comparisonTimer = null;
   let comparisonBusy = false;
   let lastComparison = [];
+  let stageName='pronto', actionName='', noticeVersion=null, newestVersion='';
+  function stage(value) { stageName=value; log('Etapa',value); }
+  function cmpVersions(x,y) {
+    const a=String(x).split('.').map(Number), b=String(y).split('.').map(Number);
+    if([...a,...b].some(n=>!Number.isInteger(n)||n<0))return 0;
+    for(let i=0;i<Math.max(a.length,b.length);i++) {
+      if((a[i]||0)!==(b[i]||0))return (a[i]||0)>(b[i]||0)?1:-1;
+    }
+    return 0;
+  }
+  function failures() {
+    try {const a=GM_getValue(ERROR_HISTORY,[]);return Array.isArray(a)?a:[];}
+    catch(_) {return [];}
+  }
+  function saveFailure(err) {
+    try {
+      const data=getData();
+      const event={time:new Date().toISOString(),version:VERSION,action:actionName||'acao',
+        stage:stageName,site:IS_BLING?'bling':'sisfrete',route:location.pathname,
+        order:data?.order||null,account:IS_SIS?sisAccountKey():null,
+        message:String(err?.message||err).slice(0,500)};
+      GM_setValue(ERROR_HISTORY,[...failures(),event].slice(-15));
+    } catch(e) {console.warn(msgPrefix,'Nao consegui registrar erro',e);}
+  }
+  function refreshVersionNotice() {
+    if(!noticeVersion)return;
+    const found=newestVersion && cmpVersions(newestVersion,VERSION)>0;
+    noticeVersion.hidden=!found;
+    noticeVersion.textContent=found ?
+      'Atualizacao '+newestVersion+' disponivel. Verifique atualizacoes no Tampermonkey.' : '';
+  }
+  function checkNewVersion(force=false) {
+    if(typeof GM_xmlhttpRequest!=='function')return;
+    const cache=GM_getValue(VERSION_CACHE,{})||{};
+    if(!force && Number.isFinite(cache.at) && Date.now()-cache.at<6*3600000) {
+      newestVersion=String(cache.version||'');refreshVersionNotice();return;
+    }
+    try {
+      GM_xmlhttpRequest({method:'GET',url:VERSION_URL,timeout:10000,
+        headers:{'Cache-Control':'no-cache'},
+        onload:r=>{
+          if(r.status!==200)return;
+          const match=String(r.responseText||'').match(/^\s*\/\/\s*@version\s+(\d+\.\d+(?:\.\d+)?)/m);
+          if(!match)return;
+          newestVersion=match[1];
+          GM_setValue(VERSION_CACHE,{at:Date.now(),version:newestVersion});
+          refreshVersionNotice();
+        }, ontimeout:()=>console.warn(msgPrefix,'Verificacao de versao expirou'),
+        onerror:()=>console.warn(msgPrefix,'Nao foi possivel verificar versao')
+      });
+    } catch(e) {console.warn(msgPrefix,'Nao foi possivel iniciar verificacao de versao',e);}
+  }
+
 
   function visible(el) {
     if (!el || el.closest('#bs-quote-panel')) return false;
@@ -1177,7 +1236,8 @@
 
   function diagnostics() {
     const data = getData();
-    const r = { pagina: location.pathname, ambiente: IS_BLING ? 'bling' : 'sisfrete',
+    const r = { versao:VERSION, etapa:stageName, acao:actionName, ultimaFalha:failures().at(-1)||null,
+      pagina: location.pathname, ambiente: IS_BLING ? 'bling' : 'sisfrete',
       origemCapturada: data?.order || null, itensCapturados: data?.items?.map(x => ({sku:x.sku, quantidade:x.qty, centavosLinha:x.lineCents})) || [], ultimoErro: lastError,
       ...(IS_SIS ? { contaIdentificada: sisAccountLabel() || null, destinoConfigurado: destination() } : {}) };
     if (IS_BLING) {
@@ -1216,8 +1276,9 @@
     if (busy) return;
     busy = true;
     for (const btn of panel.querySelectorAll('button')) btn.disabled = true;
-    try { await task(); lastError = ''; }
-    catch (e) { lastError = String(e?.message || e); markStatus('BLOQUEADO: ' + lastError, true); console.error(msgPrefix, e); }
+    actionName=task.name||'comando-manual';stage('iniciar');
+    try { await task(); lastError = ''; stage('concluido'); }
+    catch (e) { lastError = String(e?.message || e); saveFailure(e); markStatus('BLOQUEADO: ' + lastError, true); console.error(msgPrefix, e); }
     finally { busy = false; for (const btn of panel.querySelectorAll('button')) btn.disabled = false; }
   }
 
@@ -1520,7 +1581,7 @@
       'font-family:Arial,sans-serif;font-size:12px;box-sizing:border-box;';
     const titleRow = document.createElement('div');
     titleRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:7px;margin-bottom:5px';
-    const title = document.createElement('div'); title.textContent = 'Bling → Sisfrete | Cotar pedido v1.9';
+    const title = document.createElement('div'); title.textContent = 'Bling → Sisfrete | Cotar pedido v'+VERSION;
     title.style.cssText = 'font-weight:bold;font-size:14px';
     const closeButton = document.createElement('button');
     closeButton.type = 'button';
@@ -1534,6 +1595,11 @@
     });
     titleRow.append(title, closeButton);
     panel.appendChild(titleRow);
+    noticeVersion=document.createElement('div');
+    noticeVersion.hidden=true;
+    noticeVersion.style.cssText='background:#fff7ed;border:1px solid #fdba74;padding:7px;border-radius:6px;color:#9a3412;font-size:11px;margin-bottom:8px';
+    panel.appendChild(noticeVersion);
+    refreshVersionNotice();
     const sub = document.createElement('div'); sub.style.cssText = 'color:#64748b;margin-bottom:8px';
     sub.textContent = IS_BLING ? 'Origem: Bling · Pedido de venda' : 'Destino: Sisfrete · configure CD e Canal';
     if (IS_SIS) destinationSubtitle = sub;
@@ -1570,6 +1636,7 @@
 
     // Preferencia de painel independente no Bling e na Sisfrete, preservada ao navegar.
     setPanelVisibility(settings().panelHidden);
+    checkNewVersion();
     document.addEventListener('keydown', onHotkey, true);
     // Recupera o painel se um framework reconstruir o <body> ao navegar sem recarregar.
     let currentRoute = location.pathname;
