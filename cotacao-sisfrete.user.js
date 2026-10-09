@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bling -> Sisfrete | Cotacao de pedidos
 // @namespace    local.bling.sisfrete.cotacao
-// @version      1.9.0
-// @description  v1.9: F8 Bling -> reutilizar guia Sisfrete, abrir formulario e preencher/cotar automaticamente com validacoes.
+// @version      1.9.1
+// @description  v1.9.1: confirmacao robusta de CD e Canal de Vendas apos atualizacao do formulario.
 // @match        https://bling.com.br/*
 // @match        https://www.bling.com.br/*
 // @match        https://cliente.sisfrete.com.br/*
@@ -537,29 +537,28 @@
       !!ctx?.root?.querySelector('[role="combobox"][aria-disabled="true"], .el-select__wrapper.is-disabled, .el-select__wrapper[aria-disabled="true"]'));
   }
   function valueInControl(ctx, expected) {
-    if (!ctx) return false;
+    if (!ctx || !norm(expected)) return false;
     const wanted = norm(expected);
     const { root, input } = ctx;
-    const values = [input?.value, input?.getAttribute('title'), input?.getAttribute('aria-valuetext'),
-      root?.getAttribute('title')];
+    if (!root) return false;
+    const values = [input?.value, input?.getAttribute('title'), input?.getAttribute('aria-valuetext')];
     if (input?.tagName === 'SELECT') values.push(input.selectedOptions?.[0]?.textContent);
-    // Ler apenas a parte SELECIONADA dentro do campo, jamais as opcoes abertas.
-    root.querySelectorAll('.el-select__selected-item, .el-select__selection .el-select__placeholder, .el-select__placeholder, .ant-select-selection-item, .select2-selection__rendered, [class*="selected-item"], [class*="single-value"]').forEach(el => {
-      if (visible(el)) values.push(el.textContent, el.getAttribute('title'));
+    // Ler somente o texto SELECIONADO no proprio componente.
+    // Nunca ler textos soltos por coordenadas: gerava falso positivo de canal preenchido.
+    const selector = '.el-select__selected-item, .el-select__selection-item, .el-select__placeholder, .ant-select-selection-item, .select2-selection__rendered, [class*="selected-item"], [class*="single-value"]';
+    root.querySelectorAll(selector).forEach(el => {
+      if (!visible(el) || el.classList?.contains('is-transparent') ||
+          el.closest('[role="listbox"], .el-select-dropdown, .el-popper, .dropdown-menu, [role="option"]')) return;
+      values.push(el.textContent, el.getAttribute('title'));
     });
-    // Um select sem input pode mostrar o texto diretamente no seu container.
-    if (!root.querySelector('[role="option"], .el-select-dropdown__item')) values.push(root.textContent);
-    if (values.some(v => norm(v) === wanted)) return true;
-    // Fallback: ler o TEXTO DESENHADO DENTRO DO RETANGULO DO CAMPO.
-    // Nao confundir com uma opcao teletransportada para outro ponto da pagina.
-    const r = position(root);
-    if (r.height > 95) return false;
-    return textMatches(expected).some(match => {
-      const t = match.rect;
-      const cx = centerX(t), cy = centerY(t);
-      return cx >= r.left - 3 && cx <= r.right + 3 &&
-        cy >= r.top - 3 && cy <= r.bottom + 3;
-    });
+    // Frameworks que mostram a opcao diretamente no wrapper.
+    const rectangle = position(root);
+    const fields = root.querySelectorAll('input,select,textarea');
+    if (rectangle.height > 0 && rectangle.height < 95 && fields.length <= 1 &&
+        !root.querySelector('[role="option"], .el-select-dropdown__item, [role="listbox"]')) {
+      values.push(root.textContent);
+    }
+    return values.some(v => norm(v) === wanted);
   }
   function exactOption(value, selectedRoot) {
     const wanted = norm(value);
@@ -580,24 +579,41 @@
         !!el.closest('[role="listbox"], .el-select-dropdown, .el-popper, .dropdown-menu, [class*="dropdown"], [class*="options"]');
     })[0] || null;
   }
-  async function chooseByLabel(label, value) {
-    let ctx = await waitFor(() => selectContext(label), 4500, `${label}: controle`);
-    await waitFor(() => {
-      ctx = selectContext(label);
-      return ctx && !isControlDisabled(ctx);
-    }, 6500, `${label} desbloquear`);
-    if (!valueInControl(ctx, value)) {
-      userClick(ctx.trigger);
-      const option = await waitFor(() => exactOption(value, ctx.root), 5500, `opcao ${value}`);
-      userClick(option);
-      // Dar tempo para o Vue atualizar o texto apos fechar o menu.
-      await sleep(250);
+  async function selectionStaysVisible(label, value, milliseconds = 900) {
+    const until = Date.now() + milliseconds;
+    while (Date.now() < until) {
+      if (!valueInControl(selectContext(label), value)) return false;
+      await sleep(160);
     }
-    await waitFor(() => {
-      ctx = selectContext(label);
-      return valueInControl(ctx, value);
-    }, 5500, `${label} = ${value}`);
-    markStatus(`${label}: ${value} selecionado.`);
+    return true;
+  }
+  async function chooseByLabel(label, value) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let ctx = await waitFor(() => selectContext(label), 5000, `${label}: controle`);
+      await waitFor(() => {
+        ctx = selectContext(label);
+        return ctx && !isControlDisabled(ctx) && ctx;
+      }, 9000, `${label} desbloquear`);
+      if (!valueInControl(ctx, value)) {
+        userClick(ctx.trigger);
+        const option = await waitFor(() => exactOption(value, ctx.root), 7000, `opcao ${value}`);
+        userClick(option);
+      }
+      try {
+        await waitFor(() => valueInControl(selectContext(label), value), 4500, `${label} = ${value}`);
+        if (await selectionStaysVisible(label, value, 900)) {
+          markStatus(`${label}: ${value} selecionado e confirmado.`);
+          return;
+        }
+      } catch (e) {
+        if (attempt === 3) throw e;
+      }
+      if (attempt < 3) {
+        markStatus(`${label}: selecao reiniciada pelo formulario; tentando novamente...`);
+        await sleep(550);
+      }
+    }
+    throw new Error(`Nao foi possivel manter ${label} = ${value} selecionado. Cotacao bloqueada.`);
   }
   async function lookupCep(cep, city = '') {
     const el = requireField('CEP de Destino', { maxX: 95 });
@@ -1102,14 +1118,27 @@
     }
     markStatus(`Preenchendo pedido ${data.order} | CD ${dest.cd} | Canal ${dest.channel}...`);
     await chooseByLabel('Centro de Distribuicao', dest.cd);
-    await sleep(300);
+    // O canal so fica disponivel apos o CD terminar de atualizar a interface.
+    await sleep(1000);
+    if (!valueInControl(selectContext('Centro de Distribuicao'), dest.cd)) {
+      await chooseByLabel('Centro de Distribuicao', dest.cd);
+    }
     await chooseByLabel('Canal de Vendas', dest.channel);
+    await sleep(1000);
+    if (!valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
+      await chooseByLabel('Canal de Vendas', dest.channel);
+    }
     if (sisAccountKey() !== accountAtStart) throw new Error('A conta Sisfrete mudou durante a selecao de CD/canal. Interrompi por seguranca.');
     await lookupCep(data.cep, data.city || '');
     setNativeValue(requireField('Numero do Pedido'), data.order);
     const prices = await writeProducts(data);
     await sleep(650);
+    if (!valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
+      markStatus('Canal de Vendas foi limpo pela Sisfrete; selecionando novamente...');
+      await chooseByLabel('Canal de Vendas', dest.channel);
+    }
     await validateSisfrete(data, prices);
+    await sleep(650);
     if (sisAccountKey() !== accountAtStart || !valueInControl(selectContext('Centro de Distribuicao'), dest.cd) || !valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
       throw new Error('A conta, o CD ou o Canal mudou antes da cotacao. Nada foi enviado.');
     }
