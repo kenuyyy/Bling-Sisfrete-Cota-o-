@@ -921,19 +921,23 @@
       if (!row) throw new Error('Linha do SKU ' + expectedSku + ' desapareceu durante a limpeza.');
       if (inputText(row.sku)) setNativeValue(row.sku, '');
       await sleep(220);
-      row = sisfreteRows()[index];
-      if (!row) throw new Error('Linha do produto desapareceu apos limpar o SKU.');
+      row = await waitFor(() => {
+        try { return sisfreteRows()[index] || false; } catch (_) { return false; }
+      }, 1800, 'linha do produto apos limpar o SKU');
       // Se a Sisfrete limpar outros campos junto com o SKU, restaure apenas os
-      // valores capturados do proprio formulario; nao invente dimensoes/peso.
+      // valores capturados do proprio formulario; reacquire o DOM apos cada evento
+      // porque o Vue pode reconstruir a linha ao atualizar um campo.
       for (const key of editableKeys) {
-        const field = row[key];
+        const currentRow = sisfreteRows()[index];
+        const field = currentRow?.[key];
         const wanted = snapshot[key];
         if (!field || !wanted || inputText(field) === wanted || field.disabled || field.readOnly) continue;
         setNativeValue(field, wanted);
       }
       await sleep(220);
       const stable = await waitFor(() => {
-        const current = sisfreteRows()[index];
+        let current;
+        try { current = sisfreteRows()[index]; } catch (_) { return false; }
         if (!current || inputText(current.sku) !== '') return false;
         for (const key of keepKeys) {
           if (snapshot[key] && inputText(current[key]) !== snapshot[key]) return false;
