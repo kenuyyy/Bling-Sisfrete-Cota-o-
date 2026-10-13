@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bling -> Sisfrete | Cotacao de pedidos
 // @namespace    local.bling.sisfrete.cotacao
-// @version      2.0.1
-// @description  v2.0.1: corrige seletores Element Plus e confirma CD/canal sem travar.
+// @version      2.0.2
+// @description  v2.0.2: usa Total dos itens e limpa SKU apos carregar dados do produto.
 // @match        https://bling.com.br/*
 // @match        https://www.bling.com.br/*
 // @match        https://cliente.sisfrete.com.br/*
@@ -26,7 +26,7 @@
   'use strict';
 
   /*
-   * VERSAO 2.0.1 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
+   * VERSAO 2.0.2 — F8 no Bling captura, reutiliza a guia da Sisfrete, navega ao
    * formulario e preenche/cota conforme configuracao. Atualizacoes GitHub ativas.
    * Instalar a partir do arquivo cotacao-sisfrete.user.js do repositorio publico.
    * F8 e acoes manuais sao mantidos; a cotacao nao contrata frete.
@@ -36,7 +36,7 @@
    * Nao adivinha informacoes ausentes: bloqueia a cotacao e fornece diagnostico.
    * Os dados ficam no armazenamento local da extensao Tampermonkey.
    */
-  const VERSION = '2.0.0';
+  const VERSION = '2.0.2';
   const VERSION_URL = 'https://raw.githubusercontent.com/kenuyyy/Bling-Sisfrete-Cota-o-/main/cotacao-sisfrete.user.js';
   const VERSION_CACHE = 'bs_version_cache_v20';
   const ERROR_HISTORY = 'bs_error_history_v20';
@@ -488,7 +488,8 @@
     if (!previewEl) return;
     previewEl.hidden = false;
     previewEl.textContent = data ? JSON.stringify({
-      pedido: data.order, cep: data.cep, cidade: data.city || null, valorTotalVenda: brMoney(data.totalCents),
+      pedido: data.order, cep: data.cep, cidade: data.city || null,
+      valorTotalItens: Number.isSafeInteger(data.itemsTotalCents) ? brMoney(data.itemsTotalCents) : 'captura antiga; recapture no Bling',
       freteBlingTransportador: Number.isSafeInteger(data.blingFreightCents) ? brMoney(data.blingFreightCents) : 'nao identificado',
       itens: data.items, capturadoEm: data.capturedAt
     }, null, 2) : 'Ainda nao existe um pedido capturado.';
@@ -550,9 +551,9 @@
     if (!IS_BLING || !/vendas\.php/i.test(location.pathname)) throw new Error('Abra um pedido de venda na pagina do Bling.');
     const order = orderHeading();
     if (!/^\d{1,12}$/.test(order)) throw new Error('Nao encontrei o numero do pedido de venda no titulo.');
-    const totalRaw = getBlingValue('Total da venda');
-    const totalCents = moneyCents(totalRaw);
-    if (!Number.isFinite(totalCents) || totalCents <= 0) throw new Error('Nao consegui ler o TOTAL DA VENDA do Bling.');
+    const totalRaw = getBlingValue('Total dos itens');
+    const itemsTotalCents = moneyCents(totalRaw);
+    if (!Number.isFinite(itemsTotalCents) || itemsTotalCents <= 0) throw new Error('Nao consegui ler o TOTAL DOS ITENS do Bling.');
     const address = afterSection('Endereco de entrega', 'Dados adicionais');
     if (address.after == null) throw new Error('Nao encontrei a secao Endereco de entrega.');
     const cepRaw = getBlingValue('CEP', address);
@@ -569,9 +570,9 @@
         if(Number.isSafeInteger(result) && result>=0) blingFreightCents=result;
       }
     } catch(e) {console.warn(msgPrefix,'Frete Bling nao identificado',e);}
-    const data = { order, cep, city, totalCents, items, blingFreightCents, source: location.href, capturedAt: new Date().toISOString() };
+    const data = { order, cep, city, itemsTotalCents, totalBasis: 'items', items, blingFreightCents, source: location.href, capturedAt: new Date().toISOString() };
     GM_setValue(KEY, data);
-    markStatus(`Pedido ${order}: ${items.length} SKU(s), CEP ${cep}, venda R$ ${brMoney(totalCents)}. Capturado.`);
+    markStatus(`Pedido ${order}: ${items.length} SKU(s), CEP ${cep}, produtos R$ ${brMoney(itemsTotalCents)}. Capturado.`);
     showData();
     return data;
   }
@@ -797,6 +798,7 @@
       const weight = find('Peso (kg)', 'Peso');
       const unit = find('Valor Unitario (R$)', 'Valor Unitario');
       const total = find('Valor Total (R$)', 'Valor Total');
+      const cubage = find('Cubagem (m³)', 'Cubagem (m)', 'Cubagem');
       let qty = find('Quantidade');
       if (!qty && length) {
         // Campo de quantidade pode nao ter placeholder (valor padrao 1).
@@ -807,7 +809,7 @@
       // Exigir identificacao POSITIVA dos campos criticos; nao cotar por aproximacao.
       if (!qty || !unit || !total || !length || !width || !height || !weight)
         throw new Error(`Linha de produto ${i+1}: o layout mudou e nao foi possivel identificar todos os campos por nome. Cotacao bloqueada (use Diagnostico).`);
-      result.push({ sku, qty, length, width, height, weight, unit, total });
+      result.push({ sku, qty, length, width, height, cubage, weight, unit, total });
     }
     return result;
   }
@@ -828,19 +830,19 @@
     await waitFor(() => sisfreteRows().length > previousCount, 3500, 'nova linha de produto');
   }
   // Sisfrete usa valor UNITARIO com 2 casas; a soma exata deve fechar
-  // com o TOTAL DA VENDA do Bling, mesmo quando tem varios SKUs.
+  // com o TOTAL DOS ITENS do Bling, sem incluir o frete da venda.
   // Precos de Bling sao usados APENAS como pesos para a distribuicao; nao
   // representam necessariamente o valor unitario final com frete/descontos.
   function gcd(a, b) { while (b) [a, b] = [b, a % b]; return a; }
   function distributeTotal(data) {
     const lines = data.items;
-    const total = data.totalCents;
-    if (!lines.length || !Number.isSafeInteger(total) || total <= 0) throw new Error('Total da venda invalido.');
+    const total = data.itemsTotalCents;
+    if (!lines.length || !Number.isSafeInteger(total) || total <= 0) throw new Error('Total dos itens do Bling invalido.');
     if (lines.some(x => !Number.isSafeInteger(x.qty) || x.qty < 1 || x.qty > 999999)) {
       throw new Error('Quantidade de pelo menos um produto nao e um inteiro positivo valido.');
     }
     const g = lines.reduce((acc, x) => gcd(acc, x.qty), 0);
-    if (total % g !== 0) throw new Error('Nao e possivel dividir o total da venda com exatidao em precos unitarios de 2 casas: as quantidades nao permitem fechar os centavos. Cotacao bloqueada.');
+    if (total % g !== 0) throw new Error('Nao e possivel distribuir o Total dos itens com exatidao em precos unitarios de 2 casas: as quantidades nao permitem fechar os centavos. Cotacao bloqueada.');
     const weights = lines.map(x => Number(x.lineCents));
     if (weights.some(v => !Number.isSafeInteger(v) || v <= 0)) {
       if (lines.length > 1) throw new Error('Nao consegui ler o preco total de cada item do Bling: distribuicao proporcional bloqueada.');
@@ -879,9 +881,9 @@
       } else states = next;
     }
     const adjusted = states.get(delta);
-    if (!adjusted) throw new Error('Nao consegui distribuir o total exatamente entre os SKUs sem inventar valores. Cotacao bloqueada.');
+    if (!adjusted) throw new Error('Nao consegui distribuir o Total dos itens exatamente entre os SKUs sem inventar valores. Cotacao bloqueada.');
     const values = base.map((v, i) => v + adjusted.changes[i]);
-    if (values.reduce((acc, v, i) => acc + v * lines[i].qty, 0) !== total) throw new Error('Falha de conferencia dos centavos da venda.');
+    if (values.reduce((acc, v, i) => acc + v * lines[i].qty, 0) !== total) throw new Error('Falha de conferencia dos centavos do Total dos itens.');
     return values;
   }
   async function tryChooseSkuOption(sku) {
@@ -901,6 +903,54 @@
     // Autopreenchimento por eventos de input tambem pode resolver o SKU.
     return false;
   }
+  async function clearSkuAfterLookup(index, expectedSku) {
+    const initial = sisfreteRows()[index];
+    if (!initial || inputText(initial.sku) !== expectedSku) {
+      throw new Error('SKU ' + expectedSku + ' nao estava confirmado antes da limpeza.');
+    }
+    const keepKeys = ['qty', 'length', 'width', 'height', 'weight', 'unit', 'cubage', 'total'];
+    const editableKeys = ['qty', 'length', 'width', 'height', 'weight', 'unit'];
+    const snapshot = Object.fromEntries(keepKeys.map(key => [key, inputText(initial[key])]));
+    const initialWeight = decimal(snapshot.weight);
+    const initialDims = ['length', 'width', 'height'].map(key => decimal(snapshot[key]));
+    if (!(initialWeight > 0 || initialDims.every(value => value > 0))) {
+      throw new Error('O cadastro do SKU ' + expectedSku + ' nao trouxe peso ou dimensoes validos.');
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let row = sisfreteRows()[index];
+      if (!row) throw new Error('Linha do SKU ' + expectedSku + ' desapareceu durante a limpeza.');
+      if (inputText(row.sku)) setNativeValue(row.sku, '');
+      await sleep(220);
+      row = await waitFor(() => {
+        try { return sisfreteRows()[index] || false; } catch (_) { return false; }
+      }, 1800, 'linha do produto apos limpar o SKU');
+      // Se a Sisfrete limpar outros campos junto com o SKU, restaure apenas os
+      // valores capturados do proprio formulario; reacquire o DOM apos cada evento
+      // porque o Vue pode reconstruir a linha ao atualizar um campo.
+      for (const key of editableKeys) {
+        const currentRow = sisfreteRows()[index];
+        const field = currentRow?.[key];
+        const wanted = snapshot[key];
+        if (!field || !wanted || inputText(field) === wanted || field.disabled || field.readOnly) continue;
+        setNativeValue(field, wanted);
+      }
+      await sleep(220);
+      const stable = await waitFor(() => {
+        let current;
+        try { current = sisfreteRows()[index]; } catch (_) { return false; }
+        if (!current || inputText(current.sku) !== '') return false;
+        for (const key of keepKeys) {
+          if (snapshot[key] && inputText(current[key]) !== snapshot[key]) return false;
+        }
+        const weight = decimal(current.weight?.value);
+        const dimensions = [current.length, current.width, current.height].map(el => decimal(el?.value));
+        return weight > 0 || dimensions.every(value => value > 0);
+      }, 2200, 'manter dados do SKU ' + expectedSku + ' depois de limpar o codigo').catch(() => null);
+      if (stable) return;
+    }
+    throw new Error('A Sisfrete nao manteve o SKU vazio sem alterar os demais dados do produto ' + expectedSku + '. Cotacao bloqueada.');
+  }
+
   async function writeProducts(data) {
     const prices = distributeTotal(data);
     while (sisfreteRows().length < data.items.length) await addSisfreteRow();
@@ -943,6 +993,8 @@
       }
       if(!recognized)throw new Error('Produto '+item.sku+' sem dimensoes/peso depois de duas verificacoes.');
       await sleep(220);
+      await clearSkuAfterLookup(i,item.sku);
+      markStatus('Produto '+item.sku+': cadastro carregado; SKU limpo e dimensoes/peso preservados.');
     }
     return prices;
   }
@@ -952,7 +1004,7 @@
     let sum = 0;
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i], item = data.items[i];
-      if (inputText(row.sku) !== item.sku) throw new Error(`SKU da linha ${i + 1} nao confere.`);
+      if (inputText(row.sku)) throw new Error(`Campo SKU da linha ${i + 1} deveria estar vazio depois de carregar o cadastro.`);
       if (quantity(row.qty?.value) !== item.qty) throw new Error(`Quantidade da linha ${i + 1} nao confere.`);
       const unitCents = moneyCents(row.unit?.value);
       if (unitCents !== prices[i]) throw new Error(`Valor unitario da linha ${i + 1} nao confere.`);
@@ -970,7 +1022,7 @@
         throw new Error(`Produto ${item.sku} sem peso e sem dimensoes preenchidos na Sisfrete. Verifique se o SKU foi reconhecido; cotacao automatica bloqueada.`);
       }
     }
-    if (sum !== data.totalCents) throw new Error(`Somatorio das linhas R$ ${brMoney(sum)} difere da venda do Bling R$ ${brMoney(data.totalCents)}.`);
+    if (sum !== data.itemsTotalCents) throw new Error(`Somatorio das linhas R$ ${brMoney(sum)} difere do Total dos itens do Bling R$ ${brMoney(data.itemsTotalCents)}.`);
     const orderField = requireField('Numero do Pedido');
     if (inputText(orderField) !== data.order) throw new Error('Numero de pedido incorreto na Sisfrete.');
     const cepField = requireField('CEP de Destino');
@@ -979,8 +1031,8 @@
     const summary = fieldByName('Valor Total (R$)', { before: productsStart });
     if (summary && inputText(summary)) {
       const calculated = moneyCents(summary.value);
-      if (Number.isFinite(calculated) && calculated !== data.totalCents) {
-        throw new Error(`Resumo da Sisfrete = R$ ${brMoney(calculated)}; venda Bling = R$ ${brMoney(data.totalCents)}. Cotacao bloqueada.`);
+      if (Number.isFinite(calculated) && calculated !== data.itemsTotalCents) {
+        throw new Error(`Resumo da Sisfrete = R$ ${brMoney(calculated)}; Total dos itens do Bling = R$ ${brMoney(data.itemsTotalCents)}. Cotacao bloqueada.`);
       }
     }
     return true;
@@ -1256,6 +1308,9 @@
     if (!IS_SIS || !IS_SIS_QUOTE()) throw new Error('Abra a tela Nova Cotacao da Sisfrete para preencher o pedido.');
     const data = getData();
     if (!data?.order || !data?.items?.length) throw new Error('Capture um pedido de venda no Bling antes de cotar.');
+    if (data.totalBasis !== 'items' || !Number.isSafeInteger(data.itemsTotalCents)) {
+      throw new Error('Esta captura usa o valor antigo da venda. Volte ao Bling e capture novamente para usar Total dos itens, sem frete.');
+    }
     if (Date.now() - new Date(data.capturedAt).getTime() > 12 * 60 * 60 * 1000) {
       throw new Error('Captura com mais de 12 horas. Reabra e capture o pedido atualizado no Bling.');
     }
@@ -1297,7 +1352,7 @@
     if (sisAccountKey() !== accountAtStart || !valueInControl(selectContext('Centro de Distribuicao'), dest.cd) || !valueInControl(selectContext('Canal de Vendas'), dest.channel)) {
       throw new Error('A conta, o CD ou o Canal mudou antes da cotacao. Nada foi enviado.');
     }
-    markStatus(`Conferido: pedido ${data.order}, ${data.items.length} SKU(s), R$ ${brMoney(data.totalCents)}.`);
+    markStatus(`Conferido: pedido ${data.order}, ${data.items.length} SKU(s), Total dos itens R$ ${brMoney(data.itemsTotalCents)}.`);
     if (!quoteAfter) {
       stage('preenchimento-validado');
       markStatus('Preenchimento concluido e validado. Confira a tela antes de cotar.');
@@ -1325,7 +1380,7 @@
       ...(IS_SIS ? { contaIdentificada: sisAccountLabel() || null, destinoConfigurado: destination() } : {}) };
     if (IS_BLING) {
       const b = afterSection('Endereco de entrega', 'Dados adicionais');
-      r.labels = ['Total da venda', 'CEP'].map(x => ({ campo: x, valor: x === 'CEP' ? getBlingValue(x, b) : getBlingValue(x) }));
+      r.labels = ['Total dos itens', 'CEP'].map(x => ({ campo: x, valor: x === 'CEP' ? getBlingValue(x, b) : getBlingValue(x) }));
       r.itens = (() => { try { return blingItems(); } catch (e) { return e.message; } })();
     } else {
       r.labels = ['Centro de Distribuicao', 'Canal de Vendas', 'CEP de Destino', 'Destino', 'Numero do Pedido']
